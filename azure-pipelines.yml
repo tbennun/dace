@@ -31,7 +31,7 @@ jobs:
     displayName: 'Install dependencies'
 
   - script: |
-      ./test_all.sh > test-results.xml
+      ./test_all.sh
     displayName: 'test'
 
   - task: PublishTestResults@2
