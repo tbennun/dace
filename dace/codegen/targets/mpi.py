@@ -1,5 +1,5 @@
 import dace
-from dace import symbolic, types
+from dace import symbolic, dtypes
 from dace.codegen.prettycode import CodeIOStream
 from dace.codegen.codeobject import CodeObject
 from dace.codegen.targets.target import TargetCodeGenerator, make_absolute
@@ -25,7 +25,7 @@ class MPICodeGen(TargetCodeGenerator):
 
         self._codeobj = CodeObject(
             sdfg.name + '_mpi', """
-#include <dace/dace_runtime.h>
+#include <dace/dace.h>
 #include <mpi.h>
 
 MPI_Comm __dace_mpi_comm;
@@ -61,7 +61,7 @@ void __dace_exit_mpi({params}) {{
             MPICodeGen, 'MPI')
 
         # Register dispatchers
-        dispatcher.register_map_dispatcher(types.ScheduleType.MPI, self)
+        dispatcher.register_map_dispatcher(dtypes.ScheduleType.MPI, self)
 
     def get_generated_codeobjects(self):
         return [self._codeobj]

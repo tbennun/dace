@@ -10,18 +10,19 @@ if __name__ == '__main__':
     print('Multidimensional offset and stride test')
     # Externals (parameters, symbols)
     N = dp.symbol('N')
+    N.set(20)
     input = dp.ndarray([N, N], dp.float32)
     output = dp.ndarray([4, 3], dp.float32)
-    N.set(20)
     input[:] = (np.random.rand(N.get(), N.get()) * 5).astype(dp.float32.type)
     output[:] = dp.float32(0)
 
     # Construct SDFG
     mysdfg = SDFG('offset_stride')
     state = mysdfg.add_state()
-    A_ = state.add_array('A', [3, 2], dp.int32, offset=[2, 3], strides=[N, N])
+    A_ = state.add_array(
+        'A', [6, 6], dp.float32, offset=[2, 3], strides=[N, N])
     B_ = state.add_array(
-        'B', [3, 2], dp.int32, offset=[-1, -1], strides=[4, 3])
+        'B', [3, 2], dp.float32, offset=[-1, -1], strides=[4, 3])
 
     map_entry, map_exit = state.add_map('mymap', [('i', '1:4'), ('j', '1:3')])
     tasklet = state.add_tasklet('mytasklet', {'a'}, {'b'}, 'b = a')

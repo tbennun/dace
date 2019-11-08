@@ -4,16 +4,12 @@
 import copy
 import itertools
 import functools
-import networkx as nx
 import sympy
-import unittest
-import math
+import warnings
 
-from dace import data, subsets, symbolic, types
-from dace.memlet import Memlet
-from dace.graph import nodes, nxutil
-from dace.graph.graph import OrderedMultiDiGraph
-from dace.transformation import pattern_matching
+from dace import data, subsets, symbolic, dtypes
+from dace.memlet import EmptyMemlet, Memlet
+from dace.graph import nodes
 
 
 class MemletPattern(object):
@@ -155,7 +151,8 @@ class AffineSMemlet(SeparableMemletPattern):
     def match(self, dim_exprs, variable_context, node_range, orig_edges,
               dim_index, total_dims):
 
-        params = variable_context[-1]  # Why only last element?
+        params = variable_context[-1]
+        defined_vars = variable_context[-2]
         # Create wildcards for multiplication and addition
         a = sympy.Wild('a', exclude=params)
         b = sympy.Wild('b', exclude=params)
@@ -199,6 +196,8 @@ class AffineSMemlet(SeparableMemletPattern):
                 param = None
                 pind = -1
                 for indp, p in enumerate(params):
+                    if p not in subexpr.free_symbols:
+                        continue
                     matches = subexpr.match(a * p + b)
                     if param is None and matches is None:
                         continue
@@ -233,13 +232,20 @@ class AffineSMemlet(SeparableMemletPattern):
                 self.internal_range.add((brb, bre))
 
             if step is not None:
-                if self.param in step.free_symbols:
+                if (symbolic.issymbolic(step)
+                        and self.param in step.free_symbols):
                     return False  # Step must be independent of parameter
 
             node_rb, node_re, node_rs = node_range[self.paramind]
             if node_rs != 1:
                 # Map ranges where the last index is not known
                 # exactly are not supported by this pattern.
+                return False
+            if (any(s not in defined_vars for s in node_rb.free_symbols)
+                    or any(s not in defined_vars
+                           for s in node_re.free_symbols)):
+                # Cannot propagate variables only defined in this scope (e.g.,
+                # dynamic map ranges)
                 return False
 
         if self.param is None:  # and self.constant_min is None:
@@ -404,7 +410,7 @@ class ConstantSMemlet(SeparableMemletPattern):
         if isinstance(dexpr, tuple) and len(dexpr) == 3:
             # Try to match a constant expression for the range
             for rngelem in dexpr:
-                if types.isconstant(rngelem):
+                if dtypes.isconstant(rngelem):
                     continue
 
                 matches = rngelem.match(cst)
@@ -415,7 +421,7 @@ class ConstantSMemlet(SeparableMemletPattern):
 
         else:  # Single element case
             # Try to match a constant expression
-            if not types.isconstant(dexpr):
+            if not dtypes.isconstant(dexpr):
                 matches = dexpr.match(cst)
                 if matches is None or len(matches) != 1:
                     return False
@@ -440,8 +446,27 @@ class GenericSMemlet(SeparableMemletPattern):
 
     def match(self, dim_exprs, variable_context, node_range, orig_edges,
               dim_index, total_dims):
+        dims = []
+        for dim in dim_exprs:
+            if isinstance(dim, tuple):
+                dims.extend(dim)
+            else:
+                dims.append(dim)
 
         self.params = variable_context[-1]
+        defined_vars = variable_context[-2]
+
+        used_symbols = set()
+        for dim in dims:
+            if symbolic.issymbolic(dim):
+                used_symbols.update(dim.free_symbols)
+
+        if (used_symbols & set(self.params)
+                and any(s not in defined_vars
+                        for s in node_range.free_symbols)):
+            # Cannot propagate symbols that are undefined in the outer range
+            # (e.g., dynamic map ranges).
+            return False
 
         # Always matches
         return True
@@ -525,7 +550,7 @@ class ConstantRangeMemlet(MemletPattern):
         constant_range = True
         for dim in node_range:
             for rngelem in dim:  # For (begin, end, skip)
-                if not types.isconstant(rngelem) and not isinstance(
+                if not dtypes.isconstant(rngelem) and not isinstance(
                         rngelem, sympy.Number):
                     constant_range = False
                     break
@@ -599,46 +624,68 @@ def _propagate_labels(g, sdfg):
     #          of ambiguity, the function raises an exception.
     # 3. For each edge in the multigraph, collect results and group by array assigned to edge.
     #    Accumulate information about each array in the target node.
-    scope_dict = g.scope_dict()
 
-    def stop_at(parent, child):
-        # Transients should only propagate in the direction of the
-        # non-transient data
-        if isinstance(parent,
-                      nodes.AccessNode) and parent.desc(sdfg).transient:
-            for _, _, _, _, memlet in g.edges_between(parent, child):
-                if parent.data != memlet.data:
-                    return True
-            return False
-        if isinstance(child, nodes.AccessNode):
-            return False
-        return True
+    # First, propagate nested SDFGs in a bottom-up fashion
+    for node in g.nodes():
+        if isinstance(node, nodes.NestedSDFG):
+            propagate_labels_sdfg(node.sdfg)
 
-    array_data = {}  # type: dict(node -> dict(data -> list(Subset)))
-    tasklet_nodes = [
-        node for node in g.nodes() if (isinstance(node, nodes.CodeNode) or (
-            isinstance(node, nodes.AccessNode) and node.desc(sdfg).transient))
-    ]
-    # Step 1: Direction - To output
-    for start_node in tasklet_nodes:
-        for node in nxutil.dfs_topological_sort(
-                g, start_node, condition=stop_at):
-            _propagate_node(sdfg, g, node, array_data, patterns, scope_dict,
-                            True)
-    # Step 1: Direction - To input
-    array_data = {}
-    g.reverse()
-    for node in nxutil.dfs_topological_sort(
-            g, tasklet_nodes, condition=stop_at):
-        _propagate_node(sdfg, g, node, array_data, patterns, scope_dict)
+    scopes_to_process = g.scope_leaves()
+    next_scopes = set()
 
-    # To support networkx 1.11
-    g.reverse()
+    # Process scopes from the leaves upwards, propagating edges at the
+    # entry and exit nodes
+    while len(scopes_to_process) > 0:
+        for scope in scopes_to_process:
+            if scope.entry is None:
+                continue
+
+            # Propagate out of entry
+            _propagate_node(g, scope.entry)
+
+            # Propagate out of exit
+            _propagate_node(g, scope.exit)
+
+            # Add parent to next frontier
+            next_scopes.add(scope.parent)
+        scopes_to_process = next_scopes
+        next_scopes = set()
+
+
+def _propagate_node(dfg_state, node):
+    if isinstance(node, nodes.EntryNode):
+        internal_edges = [
+            e for e in dfg_state.out_edges(node)
+            if e.src_conn and e.src_conn.startswith('OUT_')
+        ]
+        external_edges = [
+            e for e in dfg_state.in_edges(node)
+            if e.dst_conn and e.dst_conn.startswith('IN_')
+        ]
+    else:
+        internal_edges = [
+            e for e in dfg_state.in_edges(node)
+            if e.dst_conn and e.dst_conn.startswith('IN_')
+        ]
+        external_edges = [
+            e for e in dfg_state.out_edges(node)
+            if e.src_conn and e.src_conn.startswith('OUT_')
+        ]
+
+    for edge in external_edges:
+        internal_edge = next(
+            e for e in internal_edges if e.data.data == edge.data.data)
+        new_memlet = propagate_memlet(dfg_state, internal_edge.data, node,
+                                      True)
+        edge._data = new_memlet
 
 
 # External API
-def propagate_memlet(dfg_state, memlet: Memlet, scope_node: nodes.EntryNode,
-                     union_inner_edges: bool):
+def propagate_memlet(dfg_state,
+                     memlet: Memlet,
+                     scope_node: nodes.EntryNode,
+                     union_inner_edges: bool,
+                     arr=None):
     """ Tries to propagate a memlet through a scope (computes the image of 
         the memlet function applied on an integer set of, e.g., a map range) 
         and returns a new memlet object.
@@ -650,11 +697,21 @@ def propagate_memlet(dfg_state, memlet: Memlet, scope_node: nodes.EntryNode,
                                   scope into account.
     """
     if isinstance(scope_node, nodes.EntryNode):
+        entry_node = scope_node
         neighboring_edges = dfg_state.out_edges(scope_node)
     elif isinstance(scope_node, nodes.ExitNode):
+        entry_node = dfg_state.scope_dict()[scope_node]
         neighboring_edges = dfg_state.in_edges(scope_node)
     else:
         raise TypeError('Trying to propagate through a non-scope node')
+    if isinstance(memlet, EmptyMemlet):
+        return EmptyMemlet()
+
+    sdfg = dfg_state.parent
+    defined_vars = [
+        symbolic.pystr_to_symbolic(s)
+        for s in (sdfg.symbols_defined_at(scope_node, dfg_state).keys())
+    ]
 
     # Find other adjacent edges within the connected to the scope node
     # and union their subsets
@@ -668,9 +725,61 @@ def propagate_memlet(dfg_state, memlet: Memlet, scope_node: nodes.EntryNode,
 
     aggdata.append(memlet)
 
-    new_subset = _propagate_edge(dfg_state.parent, None,
-                                 scope_node, None, memlet, aggdata,
-                                 MemletPattern.patterns(), None)
+    if arr is None:
+        if memlet.data not in sdfg.arrays:
+            raise KeyError('Data descriptor (Array, Stream) "%s" not defined '
+                           'in SDFG.' % memlet.data)
+        arr = sdfg.arrays[memlet.data]
+
+    # Propagate subset
+    if isinstance(entry_node, nodes.MapEntry):
+        mapnode = entry_node.map
+
+        variable_context = [
+            defined_vars,
+            [symbolic.pystr_to_symbolic(p) for p in mapnode.params]
+        ]
+
+        new_subset = None
+        for md in aggdata:
+            tmp_subset = None
+            for pattern in MemletPattern.patterns():
+                if pattern.match([md.subset], variable_context, mapnode.range,
+                                 [md]):
+                    tmp_subset = pattern.propagate(arr, [md.subset],
+                                                   mapnode.range)
+                    break
+            else:
+                # No patterns found. Emit a warning and propagate the entire
+                # array
+                warnings.warn('Cannot find appropriate memlet pattern to '
+                              'propagate %s through %s' % (str(md.subset),
+                                                           str(mapnode.range)))
+                tmp_subset = subsets.Range.from_array(arr)
+
+            # Union edges as necessary
+            if new_subset is None:
+                new_subset = tmp_subset
+            else:
+                old_subset = new_subset
+                new_subset = subsets.union(new_subset, tmp_subset)
+                if new_subset is None:
+                    warnings.warn('Subset union failed between %s and %s ' %
+                                  (old_subset, tmp_subset))
+
+        # Some unions failed
+        if new_subset is None:
+            new_subset = subsets.Range.from_array(arr)
+
+        assert new_subset is not None
+
+    elif isinstance(entry_node, nodes.ConsumeEntry):
+        # Nothing to analyze/propagate in consume
+        new_subset = subsets.Range.from_array(arr)
+    else:
+        raise NotImplementedError(
+            'Unimplemented primitive: %s' % type(scope_node))
+    ### End of subset propagation
 
     new_memlet = copy.copy(memlet)
     new_memlet.subset = new_subset
@@ -681,133 +790,10 @@ def propagate_memlet(dfg_state, memlet: Memlet, scope_node: nodes.EntryNode,
     new_memlet.num_accesses = (
         sum(m.num_accesses for m in aggdata) * functools.reduce(
             lambda a, b: a * b, scope_node.map.range.size(), 1))
+    if any(m.num_accesses == -1 for m in aggdata):
+        memlet.num_accesses = -1
+    elif symbolic.issymbolic(memlet.num_accesses) and any(
+            s not in defined_vars for s in memlet.num_accesses.free_symbols):
+        memlet.num_accesses = -1
 
     return new_memlet
-
-
-def _propagate_node(sdfg,
-                    g,
-                    node,
-                    array_data,
-                    patterns,
-                    scope_dict,
-                    write=False):
-    # Step 2: Propagate edges
-    # If this is a tasklet, we only propagate to adjacent nodes and not modify edges
-    # Special case: starting from reduction, no need for external nodes to compute edges
-    if (not isinstance(node, nodes.CodeNode)
-            and not isinstance(node, nodes.AccessNode) and node in array_data):
-        # Otherwise (if primitive), use current node information and accumulated data
-        # on arrays to set the memlets per edge
-        for _, _, target, _, memlet in g.out_edges(node):
-            # Option (a)
-            if (isinstance(target, nodes.CodeNode)):
-                continue
-
-            if not isinstance(memlet, Memlet):
-                raise AttributeError('Edge does not contain a memlet')
-
-            aggdata = None
-            if node in array_data:
-                if memlet.data in array_data[node]:
-                    aggdata = array_data[node][memlet.data]
-
-            wcr = None
-            if aggdata is not None:
-                for m in aggdata:
-                    if m.wcr is not None:
-                        wcr = (m.wcr, m.wcr_identity)
-                        break
-
-            # Compute candidate edge
-            candidate = _propagate_edge(sdfg, g, node, target, memlet, aggdata,
-                                        patterns, not write)
-            if candidate is None:
-                continue
-
-            # Option (b)
-            if isinstance(target, nodes.AccessNode):
-                # Check for data mismatch
-                if target.data != memlet.data:  #and not target.desc.transient:
-                    raise LookupError(
-                        'Mismatch between edge data %s and data node %s' %
-                        (memlet.data, target.data))
-
-            # Options (c), (d)
-            else:
-                pass
-
-            # Set new edge value
-            memlet.subset = candidate
-
-            # Number of accesses in the propagated memlet is the sum of the internal
-            # number of accesses times the size of the map range set
-            memlet.num_accesses = (
-                sum(m.num_accesses for m in aggdata) * functools.reduce(
-                    lambda a, b: a * b, node.map.range.size(), 1))
-
-            # Set WCR, if necessary
-            if wcr is not None:
-                memlet.wcr, memlet.wcr_identity = wcr
-
-    # Step 3: Accumulate edge information in adjacent node, grouped by array
-    for _, _, target, _, memlet in g.out_edges(node):
-        if (isinstance(target, nodes.CodeNode)):
-            continue
-
-        if not isinstance(memlet, Memlet):
-            raise AttributeError('Edge does not contain a memlet')
-
-        # Transients propagate only towards the data they are writing to
-        if isinstance(node, nodes.AccessNode) and node.data == memlet.data:
-            continue
-
-        # No data
-        if memlet.subset is None:
-            continue
-        #if isinstance(memlet, subsets.SequentialDependency):
-        #    continue
-
-        # Accumulate data information on target node
-        if target not in array_data:
-            array_data[target] = {}
-        if memlet.data not in array_data[target]:
-            array_data[target][memlet.data] = []
-        array_data[target][memlet.data].append(memlet)
-
-
-def _propagate_edge(sdfg, g, u, v, memlet, aggdata, patterns, reversed):
-    if ((isinstance(u, nodes.EntryNode) or isinstance(u, nodes.ExitNode))):
-        mapnode = u.map
-
-        if aggdata is None:
-            return None
-
-        # Collect data about edge
-        data = memlet.data
-        expr = [edge.subset for edge in aggdata]
-
-        if memlet.data not in sdfg.arrays:
-            raise KeyError('Data descriptor (Array, Stream) "%s" not defined '
-                           'in SDFG.' % memlet.data)
-
-        for pattern in patterns:
-            if pattern.match(
-                    expr,
-                [[symbolic.pystr_to_symbolic(p) for p in mapnode.params]],
-                    mapnode.range, aggdata):  # Only one level of context
-                return pattern.propagate(sdfg.arrays[memlet.data], expr,
-                                         mapnode.range)
-
-        # No patterns found. Emit a warning and propagate the entire array
-        print('WARNING: Cannot find appropriate memlet pattern to propagate %s'
-              % str(expr))
-
-        return subsets.Range.from_array(sdfg.arrays[memlet.data])
-    elif isinstance(u, nodes.ConsumeEntry) or isinstance(u, nodes.ConsumeExit):
-
-        # Nothing to analyze/propagate in consume
-        return subsets.Range.from_array(sdfg.arrays[memlet.data])
-
-    else:
-        raise NotImplementedError('Unimplemented primitive: %s' % type(u))

@@ -2,12 +2,10 @@
 """
 
 from __future__ import print_function
-import bisect
-import timeit
+import inspect
 from types import GeneratorType
 import dace
-from dace import sdfg as sd
-from dace.properties import make_properties, Property
+from dace.properties import make_properties, Property, SubgraphProperty
 from dace.graph import labeling, graph as gr
 import networkx as nx
 from networkx.algorithms import isomorphism as iso
@@ -73,7 +71,7 @@ class Transformation(object):
         """ Registers all transformations in a single Python file. """
 
         pattern_members = {}
-        with open(pattern_path) as pattern_file:
+        with open(filename) as pattern_file:
             exec(pattern_file.read(), pattern_members)
         for member in pattern_members.values():
             if inspect.isclass(member) and issubclass(member, Transformation):
@@ -93,10 +91,10 @@ class Transformation(object):
     # Static and object methods
 
     # Properties
-    sdfg_id = Property(dtype=int)
-    state_id = Property(dtype=int)
-    subgraph = Property(dtype=dict)
-    expr_index = Property(dtype=int)
+    sdfg_id = Property(dtype=int, category="(Debug)")
+    state_id = Property(dtype=int, category="(Debug)")
+    subgraph = SubgraphProperty(dtype=dict, category="(Debug)")
+    expr_index = Property(dtype=int, category="(Debug)")
 
     @staticmethod
     def annotates_memlets():
@@ -174,7 +172,7 @@ class Transformation(object):
             in match. Used for ordering transformations consistently.
         """
         if type(self) != type(other):
-            return type(self) < type(other)
+            return type(self).__name__ < type(other).__name__
 
         self_ids = iter(self.subgraph.values())
         other_ids = iter(self.subgraph.values())
@@ -188,17 +186,23 @@ class Transformation(object):
         except StopIteration:
             return False
 
+        self_end = False
+
         while self_id is not None and other_id is not None:
             if self_id != other_id:
                 return self_id < other_id
             try:
                 self_id = next(self_ids)
             except StopIteration:
-                return True
+                self_end = True
             try:
                 other_id = next(other_ids)
             except StopIteration:
+                if self_end:  # Transformations are equal
+                    return False
                 return False
+            if self_end:
+                return True
 
     def apply_pattern(self, sdfg):
         """ Applies this transformation on the given SDFG. """
@@ -223,6 +227,10 @@ class Transformation(object):
         string = type(self).__name__ + ' in '
         string += type(self).match_to_str(graph, self.subgraph)
         return string
+
+    @staticmethod
+    def print_debuginfo():
+        pass
 
 
 # Module functions ############################################################
@@ -320,7 +328,7 @@ def match_expression(graph,
             # We return the inverse mapping: {subgraph_node: graph_node} for
             # ease of access
             subgraph = {
-                cexpr.node[j]['node']: digraph.node[i]['node']
+                cexpr.nodes[j]['node']: digraph.nodes[i]['node']
                 for (i, j) in subgraph.items()
             }
 
@@ -360,33 +368,34 @@ def match_pattern(state_id,
     # Handling VF2 in networkx for now
     digraph = collapse_multigraph_to_nx(state)
 
-    matches = []
-
     for idx, expression in enumerate(pattern.expressions()):
         cexpr = collapse_multigraph_to_nx(expression)
         graph_matcher = iso.DiGraphMatcher(
             digraph, cexpr, node_match=node_match, edge_match=edge_match)
         for subgraph in graph_matcher.subgraph_isomorphisms_iter():
             subgraph = {
-                cexpr.node[j]['node']: state.node_id(digraph.node[i]['node'])
+                cexpr.nodes[j]['node']: state.node_id(digraph.nodes[i]['node'])
                 for (i, j) in subgraph.items()
             }
-            match_found = pattern.can_be_applied(
-                state, subgraph, idx, sdfg, strict=strict)
+            try:
+                match_found = pattern.can_be_applied(
+                    state, subgraph, idx, sdfg, strict=strict)
+            except Exception as e:
+                print('WARNING: {p}::can_be_applied triggered a {c} exception:'
+                      ' {e}'.format(p=pattern.__name__,
+                                    c=e.__class__.__name__, e=e))
+                match_found = False
             if match_found:
-                bisect.insort_left(
-                    matches,
-                    pattern(
-                        sdfg.sdfg_list.index(sdfg), state_id, subgraph, idx))
+                yield pattern(
+                    sdfg.sdfg_list.index(sdfg), state_id, subgraph, idx)
 
     # Recursive call for nested SDFGs
     for node in state.nodes():
         if isinstance(node, dace.graph.nodes.NestedSDFG):
             sub_sdfg = node.sdfg
             for i, sub_state in enumerate(sub_sdfg.nodes()):
-                matches += match_pattern(i, sub_state, pattern, sub_sdfg)
-
-    return matches
+                yield from match_pattern(
+                    i, sub_state, pattern, sub_sdfg, strict=strict)
 
 
 def match_stateflow_pattern(sdfg,
@@ -409,30 +418,29 @@ def match_stateflow_pattern(sdfg,
     # Handling VF2 in networkx for now
     digraph = collapse_multigraph_to_nx(sdfg)
 
-    matches = []
-
     for idx, expression in enumerate(pattern.expressions()):
         cexpr = collapse_multigraph_to_nx(expression)
         graph_matcher = iso.DiGraphMatcher(
             digraph, cexpr, node_match=node_match, edge_match=edge_match)
         for subgraph in graph_matcher.subgraph_isomorphisms_iter():
             subgraph = {
-                cexpr.node[j]['node']: sdfg.node_id(digraph.node[i]['node'])
+                cexpr.nodes[j]['node']: sdfg.node_id(digraph.nodes[i]['node'])
                 for (i, j) in subgraph.items()
             }
-            match_found = pattern.can_be_applied(sdfg, subgraph, idx, sdfg,
-                                                 strict)
+            try:
+                match_found = pattern.can_be_applied(sdfg, subgraph, idx, sdfg,
+                                                     strict)
+            except Exception as e:
+                print('WARNING: {p}::can_be_applied triggered a {c} exception:'
+                      ' {e}'.format(p=pattern.__name__,
+                                    c=e.__class__.__name__, e=e))
+                match_found = False
             if match_found:
-                bisect.insort_left(
-                    matches,
-                    pattern(sdfg.sdfg_list.index(sdfg), -1, subgraph, idx))
-                # matches.append(
-                #     pattern(pattern, state_id, subgraph, options))
+                yield pattern(sdfg.sdfg_list.index(sdfg), -1, subgraph, idx)
 
     # Recursive call for nested SDFGs
     for state in sdfg.nodes():
         for node in state.nodes():
             if isinstance(node, dace.graph.nodes.NestedSDFG):
-                matches += match_stateflow_pattern(node.sdfg, pattern)
-
-    return matches
+                yield from match_stateflow_pattern(
+                    node.sdfg, pattern, strict=strict)

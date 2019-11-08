@@ -80,9 +80,9 @@ class AST_ForLoop(AST_Node):
             lg_init = dace.graph.edges.InterstateEdge(
                 assignments={
                     loop_guard_var:
-                    self.var.get_name_in_sdfg(sdfg) + '[0]',
+                    self.var.get_name_in_sdfg(sdfg) + '(0)',
                     loop_end_var:
-                    self.initializer.rhs.get_name_in_sdfg(sdfg) + '[0]'
+                    self.initializer.rhs.get_name_in_sdfg(sdfg) + '(0)'
                 })
             sdfg.add_edge(sdfg.nodes()[state], s_guard, lg_init)
 
@@ -102,7 +102,7 @@ class AST_ForLoop(AST_Node):
                     edge = dace.graph.edges.InterstateEdge(
                         condition=dace.properties.CodeProperty.from_string(
                             loop_guard_var + " <= " + loop_end_var,
-                            language=dace.types.Language.Python))
+                            language=dace.dtypes.Language.Python))
                     sdfg.add_edge(prev, newstate, edge)
                 prev = sdfg.nodes()[last_state]
 
@@ -119,7 +119,7 @@ class AST_ForLoop(AST_Node):
             for_exit = dace.graph.edges.InterstateEdge(
                 condition=dace.properties.CodeProperty.from_string(
                     loop_guard_var + " > " + loop_end_var,
-                    language=dace.types.Language.Python))
+                    language=dace.dtypes.Language.Python))
             sdfg.add_edge(s_guard, s_lexit, for_exit)
 
             return state
@@ -166,7 +166,7 @@ class AST_ForLoop(AST_Node):
         for_entry = dace.graph.edges.InterstateEdge(
             condition=dace.properties.CodeProperty.from_string(
                 loop_guard_var + " < " + lend_val,
-                language=dace.types.Language.Python))
+                language=dace.dtypes.Language.Python))
         sdfg.add_edge(s_guard, s_getinit, for_entry)
 
         # Add state for each statement within the for loop
@@ -194,7 +194,7 @@ class AST_ForLoop(AST_Node):
         for_exit = dace.graph.edges.InterstateEdge(
             condition=dace.properties.CodeProperty.from_string(
                 loop_guard_var + " >= " + lend_val,
-                language=dace.types.Language.Python))
+                language=dace.dtypes.Language.Python))
         sdfg.add_edge(s_guard, s_lexit, for_exit)
 
         return state

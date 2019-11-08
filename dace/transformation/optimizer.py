@@ -9,6 +9,7 @@ import time
 import dace
 from dace.config import Config
 from dace.graph import labeling
+from dace.graph.graph import SubgraphView
 from dace.transformation import pattern_matching
 
 # This import is necessary since it registers all the patterns
@@ -64,7 +65,7 @@ class SDFGOptimizer(object):
                 ]
 
             for pattern in _patterns:
-                matches += pattern_matching.match_stateflow_pattern(
+                yield from pattern_matching.match_stateflow_pattern(
                     self.sdfg, pattern, strict=strict)
 
         state_enum = []
@@ -82,10 +83,8 @@ class SDFGOptimizer(object):
             _patterns = [p for p in patterns if p in self.patterns]
         for state_id, state in state_enum:
             for pattern in _patterns:
-                matches += pattern_matching.match_pattern(
+                yield from pattern_matching.match_pattern(
                     state_id, state, pattern, self.sdfg, strict=strict)
-
-        return matches
 
     def optimize(self, debugprint=True):
         """ A command-line UI for applying patterns on the SDFG.
@@ -93,22 +92,32 @@ class SDFGOptimizer(object):
                                console.
             @return: An optimized SDFG object
         """
+        sdfg_file = self.sdfg.name + '.sdfg'
+        if os.path.isfile(sdfg_file):
+            ui_input = input(
+                'An SDFG with the filename "%s" was found. '
+                'Would you like to use it instead? [Y/n] ' % sdfg_file)
+            if len(ui_input) == 0 or ui_input[0] not in ['n', 'N']:
+                return dace.SDFG.from_file(sdfg_file)
 
         # Visualize SDFGs during optimization process
         VISUALIZE = Config.get_bool('optimizer', 'visualize')
+        VISUALIZE_SDFV = Config.get_bool('optimizer', 'visualize_sdfv')
         SAVE_DOTS = Config.get_bool('optimizer', 'savedots')
 
         if SAVE_DOTS:
-            with open('before.dot', 'w') as dot_file:
-                dot_file.write(self.sdfg.draw())
+            self.sdfg.draw_to_file('before.dot')
+            self.sdfg.save(os.path.join('_dotgraphs', 'before.sdfg'))
             if VISUALIZE:
-                os.system('xdot before.dot&')
+                os.system('xdot _dotgraphs/before.dot&')
+            if VISUALIZE_SDFV:
+                os.system('sdfv _dotgraphs/before.sdfg&')
 
         # Optimize until there is not pattern matching or user stops the process.
         pattern_counter = 0
         while True:
             # Print in the UI all the pattern matching options.
-            ui_options = self.get_pattern_matches()
+            ui_options = sorted(self.get_pattern_matches())
             ui_options_idx = 0
             for pattern_match in ui_options:
                 sdfg = self.sdfg.sdfg_list[pattern_match.sdfg_id]
@@ -121,15 +130,9 @@ class SDFGOptimizer(object):
                 print('No viable transformations found')
                 break
 
-            # Code working for both python 2.x and 3.x.
-            try:
-                ui_input = raw_input(
-                    'Select the pattern to apply (0 - %d or name$id): ' %
-                    (ui_options_idx - 1))
-            except NameError:
-                ui_input = input(
-                    'Select the pattern to apply (0 - %d or name$id): ' %
-                    (ui_options_idx - 1))
+            ui_input = input(
+                'Select the pattern to apply (0 - %d or name$id): ' %
+                (ui_options_idx - 1))
 
             pattern_name, occurrence, param_dict = _parse_cli_input(ui_input)
 
@@ -166,11 +169,10 @@ class SDFGOptimizer(object):
             self.applied_patterns.add(type(pattern_match))
 
             if SAVE_DOTS:
-                with open(
-                        'after_%d_%s_b4lprop.dot' %
-                    (pattern_counter + 1, type(pattern_match).__name__),
-                        'w') as dot_file:
-                    dot_file.write(self.sdfg.draw())
+                filename = 'after_%d_%s_b4lprop' % (
+                    pattern_counter + 1, type(pattern_match).__name__)
+                self.sdfg.draw_to_file(filename + '.dot')
+                self.sdfg.save(os.path.join('_dotgraphs', filename + '.sdfg'))
 
             if not pattern_match.annotates_memlets():
                 labeling.propagate_labels_sdfg(self.sdfg)
@@ -178,18 +180,65 @@ class SDFGOptimizer(object):
             if True:
                 pattern_counter += 1
                 if SAVE_DOTS:
-                    with open(
-                            'after_%d_%s.dot' % (pattern_counter,
-                                                 type(pattern_match).__name__),
-                            'w') as dot_file:
-                        dot_file.write(self.sdfg.draw())
+                    filename = 'after_%d_%s' % (pattern_counter,
+                                                type(pattern_match).__name__)
+                    self.sdfg.draw_to_file(filename + '.dot')
+                    self.sdfg.save(
+                        os.path.join('_dotgraphs', filename + '.sdfg'))
+
                     if VISUALIZE:
                         time.sleep(0.7)
                         os.system(
-                            'xdot after_%d_%s.dot&' %
+                            'xdot _dotgraphs/after_%d_%s.dot&' %
+                            (pattern_counter, type(pattern_match).__name__))
+
+                    if VISUALIZE_SDFV:
+                        os.system(
+                            'sdfv _dotgraphs/after_%d_%s.sdfg&' %
                             (pattern_counter, type(pattern_match).__name__))
 
         return self.sdfg
+
+    def optimization_space(self):
+        """ Returns the optimization space of the current SDFG """
+
+        def get_actions(actions, graph, match):
+            subgraph_node_ids = match.subgraph.values()
+            subgraph_nodes = [graph.nodes()[nid] for nid in subgraph_node_ids]
+            for node in subgraph_nodes:
+                version = 0
+                while (node, type(match).__name__,
+                       match.expr_index, version) in actions.keys():
+                    version += 1
+                actions[(node, type(match).__name__,
+                         match.expr_index, version)] = match
+            subgraph = SubgraphView(graph, subgraph_nodes)
+            for edge in subgraph.edges():
+                version = 0
+                while (edge, type(match).__name__,
+                       match.expr_index, version) in actions.keys():
+                    version += 1
+                actions[(edge, type(match).__name__,
+                         match.expr_index, version)] = match
+            return actions
+
+        def get_dataflow_actions(actions, sdfg, match):
+            graph = sdfg.sdfg_list[match.sdfg_id].nodes()[match.state_id]
+            return get_actions(actions, graph, match)
+        
+        def get_stateflow_actions(actions, sdfg, match):
+            graph = sdfg.sdfg_list[match.sdfg_id]
+            return get_actions(actions, graph, match)
+
+        actions = dict()
+
+        for match in self.get_pattern_matches():
+            if match.state_id >= 0:
+                actions = get_dataflow_actions(actions, self.sdfg, match)
+            else:
+                actions = get_stateflow_actions(actions, self.sdfg, match)
+        
+        return actions           
 
 
 def _parse_cli_input(line):

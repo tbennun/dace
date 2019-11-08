@@ -16,14 +16,14 @@ def draw_edge_explicit(srcName, dstName, edge, sdfg, graph, **extraOpts):
     elif isinstance(edge.data, edges.InterstateEdge):
         opts.update(edge.data.dotOpts)
     # Unhandled properties
-    elif edge.data != None:
+    elif edge.data is not None:
         raise ValueError("Unhandled edge: " + str(edge.data))
     if extraOpts:
         opts.update(extraOpts)  # Custom options will overwrite default
 
     if isinstance(edge, gr.MultiConnectorEdge):
-        sconn = '' if edge.src_conn is None else (':' + edge.src_conn)
-        dconn = '' if edge.dst_conn is None else (':' + edge.dst_conn)
+        sconn = '' if edge.src_conn is None else (':out_' + edge.src_conn)
+        dconn = '' if edge.dst_conn is None else (':in_' + edge.dst_conn)
     else:
         sconn = ''
         dconn = ''
@@ -88,7 +88,7 @@ def draw_node(sdfg, graph, obj, **kwargs):
         connector_code = []
         for conn in sorted(obj.in_connectors):
             connector_code.append(
-                '<TD PORT="{conn}" BORDER="1" CELLPADDING="1"><FONT POINT-SIZE="10">{conn}</FONT></TD>'.
+                '<TD PORT="in_{conn}" BORDER="1" CELLPADDING="1"><FONT POINT-SIZE="10">{conn}</FONT></TD>'.
                 format(conn=conn))
         code += '<TD WIDTH="20"></TD>'.join(connector_code)
         code += '<TD WIDTH="20"></TD></TR></TABLE></TD></TR>'
@@ -104,7 +104,7 @@ def draw_node(sdfg, graph, obj, **kwargs):
         connector_code = []
         for conn in sorted(obj.out_connectors):
             connector_code.append(
-                '<TD PORT="{conn}" BORDER="1" CELLPADDING="1"><FONT POINT-SIZE="10">{conn}</FONT></TD>'.
+                '<TD PORT="out_{conn}" BORDER="1" CELLPADDING="1"><FONT POINT-SIZE="10">{conn}</FONT></TD>'.
                 format(conn=conn))
         code += '<TD WIDTH="20"></TD>'.join(connector_code)
         code += '<TD WIDTH="20"></TD></TR></TABLE></TD></TR>'
@@ -192,7 +192,25 @@ def draw_graph(sdfg, graph, standalone=True):
             e._src = newsrc
             newsrc._out_connectors.add(e.src_conn)
 
-    nodes = [x.draw_node(sdfg, graph) for x in nodes_to_draw]
+    nodes = []
+
+    def draw_recursive(toplevel):
+        for node in sdict_children[toplevel]:
+            if node not in nodes_to_draw: continue
+            if node in sdict_children:
+                name = 's%d_%d' % (sdfg.node_id(graph), graph.node_id(node))
+                nodes.append('''
+subgraph cluster_%s {
+                label = "";
+                ''' % name)
+                nodes.append(node.draw_node(sdfg, graph))
+                draw_recursive(node)
+                nodes.append('}\n')
+            else:
+                nodes.append(node.draw_node(sdfg, graph))
+
+    draw_recursive(None)
+    #nodes = [x.draw_node(sdfg, graph) for x in nodes_to_draw]
     edges = [draw_edge(sdfg, graph, e) for e in edges_to_draw]
 
     if not standalone:

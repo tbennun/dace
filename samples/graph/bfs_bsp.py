@@ -16,7 +16,8 @@ INFINITY = np.iinfo(vtype.type).max
 
 storage = dp.StorageType.Default
 
-sdfg = dp.SDFG('bfs_bsp', OrderedDict([('srcnode', dp.data.Scalar(vtype))]))
+sdfg = dp.SDFG('bfs_bsp')
+sdfg.add_symbol('srcnode', vtype)
 
 istate = sdfg.add_state('init')
 dstate = sdfg.add_state('doit')
@@ -198,7 +199,7 @@ if d < dep:
             -1,
             dp.subsets.Indices([0]),
             1,
-            wcr=dp.properties.LambdaProperty.from_string('lambda a,b: a+b'),
+            wcr='lambda a,b: a+b',
             wcr_identity=0))
     dstate.add_edge(
         ctask, 'out_frontier', nmx, 'IN_F',
@@ -217,7 +218,7 @@ if d < dep:
             -1,
             dp.subsets.Indices([0]),
             1,
-            wcr=dp.properties.LambdaProperty.from_string('lambda a,b: a+b'),
+            wcr='lambda a,b: a+b',
             wcr_identity=0))
     dstate.add_edge(
         nmx, 'OUT_F', mx, 'IN_F',
@@ -235,7 +236,7 @@ if d < dep:
             -1,
             dp.subsets.Indices([0]),
             1,
-            wcr=dp.properties.LambdaProperty.from_string('lambda a,b: a+b'),
+            wcr='lambda a,b: a+b',
             wcr_identity=0))
     dstate.add_edge(
         mx, 'OUT_F', out_frontier_stream, None,

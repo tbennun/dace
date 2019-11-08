@@ -3,7 +3,9 @@
 from collections import deque, OrderedDict
 import itertools
 import networkx as nx
-from dace.types import deduplicate
+from dace.dtypes import deduplicate
+from dace.properties import Property
+import dace.serialize
 
 
 class NodeNotFoundError(Exception):
@@ -14,6 +16,7 @@ class EdgeNotFoundError(Exception):
     pass
 
 
+@dace.serialize.serializable
 class Edge(object):
     def __init__(self, src, dst, data):
         self._src = src
@@ -37,10 +40,30 @@ class Edge(object):
         yield self._dst
         yield self._data
 
-    def toJSON(self, indent=0):
-        if self._data is None:
-            return "null"
-        return self._data.toJSON(indent)
+    def to_json(self, parent_graph):
+        # Slight hack to preserve the old format (attributes should not behave like this)
+        memlet_ret = self.data.to_json(parent_graph)
+        ret = {
+            'type': type(self).__name__,
+            'attributes': {
+                'data':
+                memlet_ret  #TODO: FIXME: Why is data() not a Property instance? (Would need MemletProperty class)
+            },
+            'src': str(parent_graph.node_id(self.src)),
+            'dst': str(parent_graph.node_id(self.dst)),
+        }
+
+        return ret
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        if json_obj['type'] != "Edge":
+            raise TypeError("Invalid data type")
+
+        ret = Edge(json_obj['src'], json_obj['dst'],
+                   json_obj['attributes']['data'])
+
+        return ret
 
     @staticmethod
     def __len__():
@@ -50,32 +73,55 @@ class Edge(object):
         self._src, self._dst = self._dst, self._src
 
 
+@dace.serialize.serializable
 class MultiEdge(Edge):
     def __init__(self, src, dst, data, key):
         super(MultiEdge, self).__init__(src, dst, data)
         self._key = key
-
-    def toJSON(self, indent=0):
-        # we loose the key here, what is that even?
-        if self._data is None:
-            return "null"
-        return self._data.toJSON(indent)
 
     @property
     def key(self):
         return self._key
 
 
+@dace.serialize.serializable
 class MultiConnectorEdge(MultiEdge):
     def __init__(self, src, src_conn, dst, dst_conn, data, key):
         super(MultiConnectorEdge, self).__init__(src, dst, data, key)
         self._src_conn = src_conn
         self._dst_conn = dst_conn
 
-    def toJSON(self, indent=0):
-        # we lose the key here, what is that even?
-        return ('%s' % ("null"
-                        if self._data is None else self._data.toJSON(indent)))
+    def to_json(self, parent_graph):
+        ret = super().to_json(parent_graph)
+
+        ret['dst_connector'] = self.dst_conn
+        ret['src_connector'] = self.src_conn
+
+        ret['type'] = "MultiConnectorEdge"
+
+        return ret
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+
+        sdfg = context['sdfg_state']
+        if sdfg is None:
+            raise Exception("parent_graph must be defined for this method")
+        data = json_obj['attributes']['data']
+        src_nid = json_obj['src']
+        dst_nid = json_obj['dst']
+
+        dst = sdfg.nodes()[int(dst_nid)]
+        src = sdfg.nodes()[int(src_nid)]
+
+        dst_conn = json_obj['dst_connector']
+        src_conn = json_obj['src_connector']
+
+        # Auto-create key (used when uniquely identifying networkx multigraph
+        # edges)
+        ret = MultiConnectorEdge(src, src_conn, dst, dst_conn, data, None)
+
+        return ret
 
     @property
     def src_conn(self):
@@ -105,52 +151,19 @@ class MultiConnectorEdge(MultiEdge):
         return 5
 
 
+@dace.serialize.serializable
 class Graph(object):
     def _not_implemented_error(self):
         return NotImplementedError("Not implemented for " + str(type(self)))
 
-    def toJSON(self, indent=0):
-        json = " " * indent + "{\n"
-        indent += 2
-        json += " " * indent + "\"type\": \"" + type(self).__name__ + "\",\n"
-        json += " " * indent + "\"nodes\": [\n"
-        indent += 2
-        for n in self.nodes():
-            json += " " * indent + "{\n"
-            indent += 2
-            json += " " * indent + "\"id\" : \"" + str(
-                self.node_id(n)) + "\",\n"
-            json += " " * indent + "\"attributes\" : " + n.toJSON(indent) + "\n"
-            indent -= 2
-            if n == self.nodes()[-1]:
-                json += " " * indent + "}\n"
-            else:
-                json += " " * indent + "},\n"
-        indent -= 2
-        json += " " * indent + "],\n"
-
-        json += " " * indent + "\"edges\": [\n"
-        for e in self.edges():
-            json += " " * indent + "{\n"
-            indent += 2
-            json += " " * indent + "\"src\" : \"" + str(self.node_id(
-                e.src)) + "\",\n"
-            if isinstance(e, MultiConnectorEdge):
-                json += " " * indent + '"src_connector" : "%s",\n' % e.src_conn
-            json += " " * indent + "\"dst\" : \"" + str(self.node_id(
-                e.dst)) + "\",\n"
-            if isinstance(e, MultiConnectorEdge):
-                json += " " * indent + '"dst_connector" : "%s",\n' % e.dst_conn
-            json += " " * indent + "\"attributes\" : " + e.toJSON(indent) + "\n"
-            indent -= 2
-            if e == self.edges()[-1]:
-                json += " " * indent + "}\n"
-            else:
-                json += " " * indent + "},\n"
-        indent -= 2
-        json += " " * indent + "]\n"
-        json += " " * indent + "}\n"
-        return json
+    def to_json(self):
+        ret = {
+            'type': type(self).__name__,
+            'attributes': dace.serialize.all_properties_to_json(self),
+            'nodes': [n.to_json(self) for n in self.nodes()],
+            'edges': [e.to_json(self) for e in self.edges()],
+        }
+        return ret
 
     def nodes(self):
         """Returns an iterable to internal graph nodes."""
@@ -167,6 +180,10 @@ class Graph(object):
     def out_edges(self, node):
         """Returns an iterable to Edge objects."""
         raise self._not_implemented_error()
+
+    def __getitem__(self, node):
+        """ Returns an iterable to neighboring nodes. """
+        return (e.dst for e in self.out_edges(node))
 
     def all_edges(self, *nodes):
         """Returns an iterable to incoming and outgoing Edge objects."""
@@ -186,12 +203,20 @@ class Graph(object):
             self.add_node(node)
 
     def node_id(self, node):
-        """Returns a numeric node ID that corresponds to the node index in the
+        """Returns a numeric ID that corresponds to the node index in the
            internal graph representation (unique)."""
         for i, n in enumerate(self.nodes()):
             if node == n:
                 return i
         raise NodeNotFoundError(node)
+
+    def edge_id(self, edge):
+        """Returns a numeric ID that corresponds to the edge index in the
+           internal graph representation (unique)."""
+        for i, e in enumerate(self.edges()):
+            if edge == e:
+                return i
+        raise EdgeNotFoundError(edge)
 
     def add_edge(self, source, destination, data):
         """Adds an edge to the graph containing the specified data.
@@ -342,6 +367,7 @@ class Graph(object):
         return nx.all_simple_paths(self._nx, source_node, dest_node)
 
 
+@dace.serialize.serializable
 class SubgraphView(Graph):
     def __init__(self, graph, subgraph_nodes):
         self._graph = graph
@@ -349,7 +375,7 @@ class SubgraphView(Graph):
         self._parallel_parent = None
 
     def is_parallel(self):
-        return self._parallel_parent != None
+        return self._parallel_parent is not None
 
     def set_parallel_parent(self, parallel_parent):
         self._parallel_parent = parallel_parent
@@ -432,6 +458,7 @@ class SubgraphView(Graph):
         return self._graph.is_multigraph()
 
 
+@dace.serialize.serializable
 class DiGraph(Graph):
     def __init__(self):
         self._nx = nx.DiGraph()
@@ -535,6 +562,7 @@ class MultiDiConnectorGraph(MultiDiGraph):
         return True
 
 
+@dace.serialize.serializable
 class OrderedDiGraph(Graph):
     """ Directed graph where nodes and edges are returned in the order they
         were added. """

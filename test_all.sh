@@ -6,6 +6,7 @@ SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
 PYTHONPATH=$SCRIPTPATH
 
 DACE_debugprint="${DACE_debugprint:-0}"
+DACE_experimental_test_serialization="${DACE_experimental_test_serialization:-1}"
 NOSTATUSBAR="${NOSTATUSBAR:-0}"
 ERRORS=0
 FAILED_TESTS=""
@@ -13,6 +14,7 @@ SKIPS=0
 SKIPPED_TESTS=""
 TESTS=0
 CURTEST=""
+TESTPREFIX=""
 TOTAL_TESTS=0
 
 TEST_TIMEOUT=10
@@ -30,14 +32,14 @@ join_by_newline() {
 }
 
 bail() {
-    ERRORSTR=$1
+    ERRORSTR="$TESTPREFIX$1"
     /bin/echo -e "${RED}ERROR${NC} in $ERRORSTR" 1>&2
     ERRORS=`expr $ERRORS + 1`
     FAILED_TESTS="${FAILED_TESTS} $ERRORSTR\n"
 }
 
 bail_skip() {
-    ERRORSTR=$1
+    ERRORSTR="$TESTPREFIX$1"
     /bin/echo -e "${YELLOW}SKIPPING${NC} $ERRORSTR" 1>&2
     SKIPS=`expr $SKIPS + 1`
     SKIPPED_TESTS="${SKIPPED_TESTS} $ERRORSTR\n"
@@ -46,8 +48,8 @@ bail_skip() {
 
 test_start() {
     TESTS=`expr $TESTS + 1`
-    CURTEST=$1
-    echo "---------- TEST: $1 ----------"
+    CURTEST="$TESTPREFIX$1"
+    echo "---------- TEST: $TESTPREFIX$1 ----------"
 }
 
 testcmd() {
@@ -89,12 +91,6 @@ runtest_cu() {
     if [ $? -ne 0 ]; then bail $1; fi
 }
 
-runtest_optscript() {
-    test_start $1
-    testcmd $SCRIPTPATH/scripts/diode --local --headless --optscript=$1
-    if [ $? -ne 0 ]; then bail $1; fi
-}
-
 runtest_octave() {
     test_start $1
     testcmd $SCRIPTPATH/scripts/dacelab $1
@@ -132,6 +128,8 @@ echo "====== All-Inclusive Test Runner ======"
 
 cd $SCRIPTPATH/tests
 
+SUBTESTS=`find . -type d -not -name '.*' | cut -c3- | grep -v "/[._]" | grep -v '^[._]'`
+
 DACE_compiler_use_cache=0
 DACE_optimizer_interface="dace.transformation.optimizer.SDFGOptimizer"
 DACE_optimizer_detect_control_flow=1
@@ -144,8 +142,6 @@ if [ $# -ne 0 ]; then
             runtest_cpp $arg
         elif [[ $arg == *_test.cu ]]; then
             runtest_cu $arg
-        elif [[ $arg == *_test_opt.py ]]; then
-            runtest_optscript $arg
         elif [[ $arg == *_test.py ]]; then
             runtest_py $arg
         elif [[ $arg == *.m ]]; then
@@ -159,66 +155,80 @@ if [ $# -ne 0 ]; then
 fi
 
 # Count tests first
-for file in *_test.cpp; do
-    if [ $file == '*_test.cpp' ]; then break; fi # No files found
-    TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
-done
+counttests() {
+    for file in *_test.cpp; do
+        if [ $file == '*_test.cpp' ]; then break; fi # No files found
+        TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
+    done
 
-for file in *_test.cu; do
-    if [ $file == '*_test.cu' ]; then break; fi # No files found
-    TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
-done
+    for file in *_test.cu; do
+        if [ $file == '*_test.cu' ]; then break; fi # No files found
+        TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
+    done
 
-for file in *_test_opt.py; do
-    if [ $file == '*_test_opt.py' ]; then break; fi # No files found
-    TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
-done
+    for file in *_test.py; do
+        if [ $file == '*_test.py' ]; then break; fi # No files found
+        TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
+    done
 
-for file in *_test.py; do
-    if [ $file == '*_test.py' ]; then break; fi # No files found
-    TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
-done
+    for file in *.m; do
+        if [ $file == '*.m' ]; then break; fi # No files found
+        TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
+    done
 
-for file in octave/*.m; do
-    if [ $file == '*.m' ]; then break; fi # No files found
-    TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
-done
+    for file in *_test.sh; do
+        if [ $file == '*_test.sh' ]; then break; fi # No files found
+        TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
+    done
+}
 
-for file in *_test.sh; do
-    if [ $file == '*_test.sh' ]; then break; fi # No files found
-    TOTAL_TESTS=`expr $TOTAL_TESTS + 1`
+# Count tests in top-level folder
+cd $SCRIPTPATH/tests
+counttests
+
+# Count sub-tests
+for test in $SUBTESTS; do
+    cd $SCRIPTPATH/tests/$test
+    counttests
 done
 
 ################################################################
 
-for file in *_test.cpp; do
-    if [ $file == '*_test.cpp' ]; then break; fi # No files found
-    runtest_cpp $file
-done
+runtests() {
+    for file in *_test.cpp; do
+        if [ $file == '*_test.cpp' ]; then break; fi # No files found
+        runtest_cpp $file
+    done
 
-for file in *_test.cu; do
-    if [ $file == '*_test.cu' ]; then break; fi # No files found
-    runtest_cu $file
-done
+    for file in *_test.cu; do
+        if [ $file == '*_test.cu' ]; then break; fi # No files found
+        runtest_cu $file
+    done
 
-for file in *_test_opt.py; do
-    if [ $file == '*_test_opt.py' ]; then break; fi # No files found
-    runtest_optscript $file
-done
+    for file in *_test.py; do
+        if [ $file == '*_test.py' ]; then break; fi # No files found
+        runtest_py $file
+    done
 
-for file in *_test.py; do
-    if [ $file == '*_test.py' ]; then break; fi # No files found
-    runtest_py $file
-done
+    for file in *.m; do
+        if [ $file == '*.m' ]; then break; fi # No files found
+        runtest_octave $file
+    done
 
-for file in octave/*.m; do
-    if [ $file == '*.m' ]; then break; fi # No files found
-    runtest_octave $file
-done
+    for file in *_test.sh; do
+        if [ $file == '*_test.sh' ]; then break; fi # No files found
+        runtest_sh $file
+    done
+}
 
-for file in *_test.sh; do
-    if [ $file == '*_test.sh' ]; then break; fi # No files found
-    runtest_sh $file
+cd $SCRIPTPATH/tests
+TESTPREFIX=""
+runtests
+
+for test in $SUBTESTS; do
+    cd $SCRIPTPATH/tests/$test
+    TESTPREFIX="$test/"
+    runtests
 done
 
 endreport

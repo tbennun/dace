@@ -1,8 +1,10 @@
-from dace import data, symbolic, types
+import dace.serialize
+from dace import data, symbolic, dtypes
 import re
 import sympy as sp
 from functools import reduce
 from sympy.core.sympify import SympifyError
+import warnings
 
 
 class Subset(object):
@@ -42,6 +44,7 @@ def _tuple_to_symexpr(val):
             if isinstance(val, tuple) else symbolic.pystr_to_symbolic(val))
 
 
+@dace.serialize.serializable
 class Range(Subset):
     """ Subset defined in terms of a fixed range. """
 
@@ -61,9 +64,54 @@ class Range(Subset):
         self.ranges = parsed_ranges
         self.tile_sizes = parsed_tiles
 
+    def to_json(self):
+        ret = []
+
+        def a2s(obj):
+            if isinstance(obj, symbolic.SymExpr):
+                return {'main': str(obj.expr), 'approx': str(obj.approx)}
+            else:
+                return str(obj)
+
+        # TODO: Check if approximations should also be saved
+        for (start, end, step), tile in zip(self.ranges, self.tile_sizes):
+            ret.append({
+                'start': a2s(start),
+                'end': a2s(end),
+                'step': a2s(step),
+                'tile': a2s(tile)
+            })
+
+        return {'type': 'Range', 'ranges': ret}
+
+    @staticmethod
+    def from_json(obj, context=None):
+        if not isinstance(obj, dict):
+            raise TypeError("Expected dict, got {}".format(type(obj)))
+        if obj['type'] != 'Range':
+            raise TypeError(
+                "from_json of class \"Range\" called on json "
+                "with type %s (expected 'Range')" % obj['type'])
+
+        ranges = obj['ranges']
+        tuples = []
+
+        def p2s(x):
+            pts = symbolic.pystr_to_symbolic
+            if isinstance(x, str):
+                return pts(x)
+            else:
+                return symbolic.SymExpr(pts(x['main']), pts(x['approx']))
+
+        for r in ranges:
+            tuples.append((p2s(r['start']), p2s(r['end']), p2s(r['step']),
+                           p2s(r['tile'])))
+
+        return Range(tuples)
+
     @staticmethod
     def from_array(array):
-        """ Constructs a range that covers the full array given as input. 
+        """ Constructs a range that covers the full array given as input.
             @type array: dace.data.Data """
         return Range([(0, s - 1, 1) for s in array.shape])
 
@@ -125,9 +173,9 @@ class Range(Subset):
     def coord_at(self, i):
         """ Returns the offseted coordinates of this subset at
             the given index tuple.
-            
+
             For example, the range [2:10:2] at index 2 would return 6 (2+2*2).
-            
+
             @param i: A tuple of the same dimensionality as subset.dims() or
                       subset.data_dims().
             @return: Absolute coordinates for index i (length equal to
@@ -151,13 +199,13 @@ class Range(Subset):
     def at(self, i, global_shape):
         """ Returns the absolute index (1D memory layout) of this subset at
             the given index tuple.
-            
+
             For example, the range [2:10:2] at index 2 would return 6 (2+2*2).
-            
+
             @param i: A tuple of the same dimensionality as subset.dims() or
                       subset.data_dims().
-            @param global_shape: The full size of the set that we are 
-                                 subsetting (e.g., full array strides/padded 
+            @param global_shape: The full size of the set that we are
+                                 subsetting (e.g., full array strides/padded
                                  shape).
             @return: Absolute 1D index at coordinate i.
         """
@@ -175,13 +223,16 @@ class Range(Subset):
                 for rb, re, _ in self.ranges) + sum(1 if ts != 1 else 0
                                                     for ts in self.tile_sizes))
 
-    def offset(self, other, negative):
+    def offset(self, other, negative, indices=None):
         if not isinstance(other, Subset):
             other = Indices([other for _ in self.ranges])
         mult = -1 if negative else 1
-        for i, off in enumerate(other.min_element()):
+        if not indices:
+            indices = set(range(len(self.ranges)))
+        off = other.min_element()
+        for i in indices:
             rb, re, rs = self.ranges[i]
-            self.ranges[i] = (rb + mult * off, re + mult * off, rs)
+            self.ranges[i] = (rb + mult * off[i], re + mult * off[i], rs)
 
     def dims(self):
         return len(self.ranges)
@@ -371,6 +422,12 @@ class Range(Subset):
         return ", ".join(
             [Range.dim_to_string(s, t) for s, t in zip(slice, tile_sizes)])
 
+    @staticmethod
+    def ndslice_to_string_list(slice, tile_sizes=None):
+        if tile_sizes is None:
+            return [Range.dim_to_string(s) for s in slice]
+        return [Range.dim_to_string(s, t) for s, t in zip(slice, tile_sizes)]
+
     def ndrange(self):
         return [(rb, re, rs) for rb, re, rs in self.ranges]
 
@@ -429,7 +486,43 @@ class Range(Subset):
         else:
             raise NotImplementedError
 
+    def squeeze(self):
+        shape = self.size()
+        non_ones = [i for i, d in enumerate(shape) if d != 1]
+        squeezed_ranges = [self.ranges[i] for i in non_ones]
+        squeezed_tsizes = [self.tile_sizes[i] for i in non_ones]
+        if not squeezed_ranges:
+            squeezed_ranges = [(0, 0, 1)]
+            squeezed_tsizes = [1]
+            non_ones = [len(shape) - 1]
+        self.ranges = squeezed_ranges
+        self.tile_sizes = squeezed_tsizes
+        self.offset(self, True)
+        return non_ones
 
+    def unsqueeze(self, axes):
+        for axis in sorted(axes):
+            self.ranges.insert(axis, (0, 0, 1))
+            self.tile_sizes.insert(axis, 1)
+
+    def pop(self, dimensions):
+        new_ranges = []
+        new_tsizes = []
+        for i in range(len(self.ranges)):
+            if i not in dimensions:
+                new_ranges.append(self.ranges[i])
+                new_tsizes.append(self.tile_sizes[i])
+        if not new_ranges:
+            new_ranges = [self.ranges[-1]]
+            new_tsizes = [self.tile_sizes[-1]]
+        self.ranges = new_ranges
+        self.tile_sizes = new_tsizes
+
+    def string_list(self):
+        return Range.ndslice_to_string_list(self.ranges, self.tile_sizes)
+
+
+@dace.serialize.serializable
 class Indices(Subset):
     """ A subset of one element representing a single index in an
         N-dimensional data descriptor. """
@@ -445,6 +538,29 @@ class Indices(Subset):
         else:
             self.indices = symbolic.pystr_to_symbolic(indices)
         self.tile_sizes = [1]
+
+    def to_json(self):
+
+        def a2s(obj):
+            if isinstance(obj, symbolic.SymExpr):
+                return str(obj.expr)
+            else:
+                return str(obj)
+
+        return {
+            'type': 'Indices',
+            'indices': list(map(a2s, self.indices))
+        }
+
+    @staticmethod
+    def from_json(obj, context=None):
+        if obj['type'] != 'Indices':
+            raise TypeError(
+                "from_json of class \"Indices\" called on json "
+                "with type %s (expected 'Indices')" % obj['type'])
+
+        #return Indices(symbolic.SymExpr(obj['indices']))
+        return Indices([*map(symbolic.pystr_to_symbolic, obj['indices'])])
 
     def __hash__(self):
         return hash(tuple(i for i in self.indices))
@@ -503,8 +619,8 @@ class Indices(Subset):
             the given index tuple.
             For example, the range [2:10::2] at index 2 would return 6 (2+2*2).
             @param i: A tuple of the same dimensionality as subset.dims().
-            @param global_shape: The full size of the set that we are 
-                                 subsetting (e.g., full array strides/padded 
+            @param global_shape: The full size of the set that we are
+                                 subsetting (e.g., full array strides/padded
                                  shape).
             @return: Absolute 1D index at coordinate i.
         """
@@ -524,7 +640,7 @@ class Indices(Subset):
     def free_symbols(self):
         result = set()
         for dim in self.indices:
-            result.update(set(symbolic.symlist(d)))
+            result.update(set(symbolic.symlist(dim)))
         return result
 
     @staticmethod
@@ -570,6 +686,10 @@ class Indices(Subset):
     def compose(self, other):
         raise TypeError('Index subsets cannot be composed with other subsets')
 
+    def unsqueeze(self, axes):
+        for axis in sorted(axes):
+            self.indices.insert(axis, 0)
+
 
 def bounding_box_union(subset_a: Subset, subset_b: Subset) -> Range:
     """ Perform union by creating a bounding-box of two subsets. """
@@ -581,3 +701,37 @@ def bounding_box_union(subset_a: Subset, subset_b: Subset) -> Range:
         subset_a.min_element(), subset_b.min_element(), subset_a.max_element(),
         subset_b.max_element())]
     return Range(result)
+
+
+def union(subset_a: Subset, subset_b: Subset) -> Subset:
+    """ Compute the union of two Subset objects.
+        If the subsets are not of the same type, degenerates to bounding-box
+        union.
+        @param subset_a: The first subset.
+        @param subset_b: The second subset.
+        @return: A Subset object whose size is at least the union of the two
+                 inputs. If union failed, returns None.
+    """
+    try:
+        if type(subset_a) != type(subset_b):
+            return bounding_box_union(subset_a, subset_b)
+        elif subset_a is not None and subset_b is None:
+            return subset_a
+        elif subset_b is not None and subset_a is None:
+            return subset_b
+        elif subset_a is None and subset_b is None:
+            raise TypeError('Both subsets cannot be None')
+        elif isinstance(subset_a, Indices):
+            # Two indices. If they are adjacent, returns a range that contains both,
+            # otherwise, returns a bounding box of the two
+            return bounding_box_union(subset_a, subset_b)
+        elif isinstance(subset_a, Range):
+            # TODO(later): More involved Strided-Tiled Range union
+            return bounding_box_union(subset_a, subset_b)
+        else:
+            warnings.warn(
+                'Unrecognized Subset type %s in union, degenerating to'
+                ' bounding box' % type(subset_a).__name__)
+            return bounding_box_union(subset_a, subset_b)
+    except TypeError:  # cannot determine truth value of Relational
+        return None

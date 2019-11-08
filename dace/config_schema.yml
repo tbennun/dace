@@ -44,13 +44,19 @@ required:
                 title: Visualize SDFG
                 description: Open a GraphViz window after every transformation.
 
+            visualize_sdfv:
+                type: bool
+                default: false
+                title: Visualize SDFG
+                description: Open a SDFV in browser every transformation.
+
             savedots:
                 type: bool
                 default: false
                 title: Save dot files
                 description: Save GraphViz .dot files after every transformation.
 
-            automatic_state_fusion:
+            automatic_strict_transformations:
                 type: bool
                 default: true
                 title: Automatic strict transformations
@@ -183,6 +189,7 @@ required:
                         title: Arguments
                         description: Compiler argument flags
                         default: '-std=c++14 -Xcompiler -fPIC -O3 -Xcompiler -march=native --use_fast_math -Xcompiler -Wno-unused-parameter'
+                        default_Windows: '-std=c++14 -O3 --use_fast_math'
 
                     cuda_arch:
                         type: str
@@ -209,6 +216,14 @@ required:
                             generate. Special values: -1 only uses the 
                             default stream, 0 uses infinite concurrent streams.
                         default: 0
+
+                    syncdebug:
+                        type: bool
+                        title: Synchronous Debugging
+                        description: >
+                            Enables Synchronous Debugging mode, where each CUDA call
+                            is followed by full-device synchronization and error checking.
+                        default: false
 
                     additional_args:
                         type: str
@@ -361,7 +376,7 @@ required:
                         title: Check arguments 
                         description: >
                             Do strict verification that arguments passed when
-                            calling a DaCe program match the expected types.
+                            calling a DaCe program match the expected dtypes.
 
                     execcmd:
                         type: str
@@ -548,11 +563,18 @@ required:
         title: Instrumentation
         description: Instrumentation preferences
         required:
-            enable_papi:
+            thread_nums:
+                type: str
+                title: PAPI thread test set
+                default: "[1,2,3,4]"
+                description: >
+                    Measures performance of all provided values for OMP_NUM_THREADS.
+            enable_overhead_compensation:
                 type: bool
-                title: Enable PAPI
-                default: false
-                description: Enable instrumentation using PAPI
+                title: Compensate Overhead
+                default: true
+                description: >
+                    Subtracts the minimum measured overhead from every measurement.
             enable_vectorization_analysis:
                 type: bool
                 title: Enable vectorization check
@@ -572,15 +594,66 @@ required:
                 description: >
                     Sets the default PAPI counter list, formatted as 
                     a Python list of strings.
+            vec_papi_counters:
+                type: str
+                title: "Vector PAPI counters"
+                default: "['0x40000025', '0x40000026', '0x40000027', '0x40000028', '0x40000021', '0x40000022', '0x40000023', '0x40000024']"
+                description: "Sets the vector PAPI counter list. Provide in python list format."
+            mem_papi_counters:
+                type: str
+                title: "Memory PAPI counters"
+                default: "['PAPI_MEM_WCY', 'PAPI_LD_INS', 'PAPI_SR_INS']"
+                description: "Sets the memory PAPI counter list. Provide in python list format."
+            cache_papi_counters:
+                type: str
+                title: "Cache PAPI counters"
+                default: "['PAPI_CA_SNP', 'PAPI_CA_SHR', 'PAPI_CA_CLN', 'PAPI_CA_ITV']"
+                description: "Sets the cache PAPI counter list. Provide in python list format."
             max_scope_depth:
                 type: int
-                title: Max scope depth
-                default: 5
+                title: "Max scope depth"
+                default: 0
                 description: >
                     Sets the maximum depth of instrumentations in
                     map/consume scopes. Scopes that are deeper will not 
                     be instrumented.
+            papi_mode:
+                type: str
+                title: "PAPI counter mode"
+                default: "default"
+                description: "[Internal] Allows switching between different counter modes. Users should ignore this"
+            multimode_run:
+                type: bool
+                title: "Multimode runs"
+                default: false
+                description: "Runs more runs with different counters for more information. See the '* PAPI counters' options"
+            sql_backend_enable:
+                type: bool
+                title: "Use SQL"
+                default: true
+                description: "Use the SQL backend to analyze values. Set to false to pass all performance data directly to the HTML5 renderer (deprecated)"
+            sql_database_file:
+                type: str
+                title: "Perfdata output database"
+                default: "perfdata.db"
+                description: "Output target sqlite3 file path"
             
+    #############################################
+    # Frontend settings
+
+    frontend:
+        type: dict
+        title: Frontend
+        description: Python frontend preferences
+        required:
+            implementation:
+                type: str
+                default: "sdfg"
+                title: Default operator implementation
+                description: >
+                    Sets the default operator implementation when parsing Python code into
+                    subgraphs or tasklets (can be sdfg, mkl, cublas).
+
     #############################################
     # General settings
     debugprint:
@@ -600,3 +673,26 @@ required:
         default: 100
         title: Profiling Repetitions
         description: Number of times to run program for profiling.
+
+    #############################################
+    # Experimental features
+
+    experimental:
+        type: dict
+        title: Experimental
+        description: Experimental features
+        required:
+            validate_undefs:
+                type: bool
+                default: false
+                title: Undefined Symbol Check
+                description: >
+                    Check for undefined symbols in memlets during SDFG validation.
+
+            test_serialization:
+                type: bool
+                default: false
+                title: Test Serialization on validation
+                description: >
+                    Before generating code, verify that a serialization/deserialization loop
+                    generates the same SDFG.

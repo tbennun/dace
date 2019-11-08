@@ -1,16 +1,16 @@
 import functools
-import operator
-import re
+import re, json
 import copy as cp
 import sympy as sp
+import numpy
 
-import dace
+import dace, dace.dtypes as dtypes
 from dace.codegen import cppunparse
 from dace import symbolic
 from dace.properties import (Property, make_properties, ReferenceProperty,
                              ShapeProperty, SubsetProperty, SymbolicProperty,
                              TypeClassProperty, DebugInfoProperty,
-                             CodeProperty)
+                             CodeProperty, ListProperty)
 
 
 def validate_name(name):
@@ -19,6 +19,27 @@ def validate_name(name):
     if re.match(r'^[a-zA-Z_][a-zA-Z_0-9]*$', name) is None:
         return False
     return True
+
+
+def create_datadescriptor(obj):
+    """ Creates a data descriptor from various types of objects.
+        @see: dace.data.Data
+    """
+    from dace import dtypes  # Avoiding import loops
+    if isinstance(obj, Data):
+        return obj
+
+    try:
+        return obj.descriptor
+    except AttributeError:
+        if isinstance(obj, numpy.ndarray):
+            return Array(
+                dtype=dtypes.typeclass(obj.dtype.type), shape=obj.shape)
+        if symbolic.issymbolic(obj):
+            return Scalar(symbolic.symtype(obj))
+        if isinstance(obj, dtypes.typeclass):
+            return Scalar(obj)
+        return Scalar(dtypes.typeclass(type(obj)))
 
 
 @make_properties
@@ -31,11 +52,11 @@ class Data(object):
     shape = ShapeProperty()
     transient = Property(dtype=bool)
     storage = Property(
-        dtype=dace.types.StorageType,
+        dtype=dace.dtypes.StorageType,
         desc="Storage location",
-        enum=dace.types.StorageType,
-        default=dace.types.StorageType.Default,
-        from_string=lambda x: types.StorageType[x])
+        choices=dace.dtypes.StorageType,
+        default=dace.dtypes.StorageType.Default,
+        from_string=lambda x: dtypes.StorageType[x])
     location = Property(
         dtype=str,  # Dict[str, symbolic]
         desc='Full storage location identifier (e.g., rank, GPU ID)',
@@ -70,6 +91,13 @@ class Data(object):
                             'or symbols')
         return True
 
+    def to_json(self):
+        attrs = dace.serialize.all_properties_to_json(self)
+
+        retdict = {"type": type(self).__name__, "attributes": attrs}
+
+        return retdict
+
     def copy(self):
         raise RuntimeError(
             'Data descriptors are unique and should not be copied')
@@ -78,7 +106,7 @@ class Data(object):
         """ Check for equivalence (shape and type) of two data descriptors. """
         raise NotImplementedError
 
-    def signature(self, with_types=True, name=None):
+    def signature(self, with_types=True, for_call=False, name=None):
         """Returns a string for a C++ function signature (e.g., `int *A`). """
         raise NotImplementedError
 
@@ -95,7 +123,7 @@ class Scalar(Data):
     def __init__(self,
                  dtype,
                  transient=False,
-                 storage=dace.types.StorageType.Default,
+                 storage=dace.dtypes.StorageType.Default,
                  allow_conflicts=False,
                  location='',
                  toplevel=False,
@@ -104,6 +132,19 @@ class Scalar(Data):
         shape = [1]
         super(Scalar, self).__init__(dtype, shape, transient, storage,
                                      location, toplevel, debuginfo)
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        if json_obj['type'] != "Scalar":
+            raise TypeError("Invalid data type")
+
+        # Create dummy object
+        ret = Scalar(dace.dtypes.int8)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+
+        # Check validity now
+        ret.validate()
+        return ret
 
     def __repr__(self):
         return 'Scalar (dtype=%s)' % self.dtype
@@ -128,8 +169,11 @@ class Scalar(Data):
             return False
         return True
 
-    def signature(self, with_types=True, name=None):
-        if not with_types: return name
+    def signature(self, with_types=True, for_call=False, name=None):
+        if not with_types or for_call: return name
+        if isinstance(self.dtype, dace.callback):
+            assert name is not None
+            return self.dtype.signature(name)
         return str(self.dtype.ctype) + ' ' + name
 
     def sizes(self):
@@ -157,11 +201,11 @@ def set_materialize_func(obj, val):
         immaterial.
     """
     if val is not None:
-        if (obj.storage != dace.types.StorageType.Default
-                and obj.storage != dace.types.StorageType.Immaterial):
+        if (obj.storage != dace.dtypes.StorageType.Default
+                and obj.storage != dace.dtypes.StorageType.Immaterial):
             raise ValueError("Immaterial array must have immaterial storage, "
                              "but has: {}".format(storage))
-        obj.storage = dace.types.StorageType.Immaterial
+        obj.storage = dace.dtypes.StorageType.Immaterial
     obj._materialize_func = val
 
 
@@ -174,9 +218,9 @@ class Array(Data):
     # TODO: Should we use a Code property here?
     materialize_func = Property(
         dtype=str, allow_none=True, setter=set_materialize_func)
-    access_order = Property(dtype=tuple)
-    strides = Property(dtype=list)
-    offset = Property(dtype=list)
+    access_order = ListProperty(element_type=int)
+    strides = ListProperty(element_type=symbolic.pystr_to_symbolic)
+    offset = ListProperty(element_type=symbolic.pystr_to_symbolic)
     may_alias = Property(
         dtype=bool,
         default=False,
@@ -189,7 +233,7 @@ class Array(Data):
                  materialize_func=None,
                  transient=False,
                  allow_conflicts=False,
-                 storage=dace.types.StorageType.Default,
+                 storage=dace.dtypes.StorageType.Default,
                  location='',
                  access_order=None,
                  strides=None,
@@ -234,6 +278,31 @@ class Array(Data):
                      self.location, self.access_order, self.strides,
                      self.offset, self.may_alias, self.toplevel,
                      self.debuginfo)
+
+    def to_json(self):
+        attrs = dace.serialize.all_properties_to_json(self)
+
+        # Take care of symbolic expressions
+        attrs['strides'] = list(map(str, attrs['strides']))
+
+        retdict = {"type": type(self).__name__, "attributes": attrs}
+
+        return retdict
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        if json_obj['type'] != "Array":
+            raise TypeError("Invalid data type")
+
+        # Create dummy object
+        ret = Array(dace.dtypes.int8, ())
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        # TODO: This needs to be reworked (i.e. integrated into the list property)
+        ret.strides = list(map(symbolic.pystr_to_symbolic, ret.strides))
+
+        # Check validity now
+        ret.validate()
+        return ret
 
     def validate(self):
         super(Array, self).validate()
@@ -294,7 +363,7 @@ class Array(Data):
             return False
 
         # Test type
-        if self.dtype != other.type:
+        if self.dtype != other.dtype:
             return False
 
         # Test dimensionality
@@ -322,14 +391,16 @@ class Array(Data):
                     return False
         return True
 
-    def signature(self, with_types=True, name=None):
+    def signature(self, with_types=True, for_call=False, name=None):
         arrname = name
         if self.materialize_func is not None:
-            arrname = '/* ' + arrname + ' (immaterial) */'
-            if not with_types:
+            if for_call:
                 return 'nullptr'
+            if not with_types:
+                return arrname
+            arrname = '/* ' + arrname + ' (immaterial) */'
 
-        if not with_types:
+        if not with_types or for_call:
             return arrname
         if self.may_alias:
             return str(self.dtype.ctype) + ' *' + arrname
@@ -341,15 +412,19 @@ class Array(Data):
             for d in self.shape
         ]
 
+    # OPERATORS
+    #def __add__(self, other):
+    #    return (self, None)
+
 
 @make_properties
 class Stream(Data):
     """ Stream (or stream array) data descriptor. """
 
     # Properties
-    strides = Property(dtype=list)
-    offset = Property(dtype=list)
-    buffer_size = Property(dtype=int, desc="Size of internal buffer.")
+    strides = ListProperty(element_type=symbolic.pystr_to_symbolic)
+    offset = ListProperty(element_type=symbolic.pystr_to_symbolic)
+    buffer_size = SymbolicProperty(desc="Size of internal buffer.")
     veclen = Property(
         dtype=int, desc="Vector length. Memlets must adhere to this.")
 
@@ -359,7 +434,7 @@ class Stream(Data):
                  buffer_size,
                  shape=None,
                  transient=False,
-                 storage=dace.types.StorageType.Default,
+                 storage=dace.dtypes.StorageType.Default,
                  location='',
                  strides=None,
                  offset=None,
@@ -388,6 +463,36 @@ class Stream(Data):
 
         super(Stream, self).__init__(dtype, shape, transient, storage,
                                      location, toplevel, debuginfo)
+
+    def to_json(self):
+        attrs = dace.serialize.all_properties_to_json(self)
+
+        # Take care of symbolic expressions
+        attrs['strides'] = list(map(str, attrs['strides']))
+
+        retdict = {"type": type(self).__name__, "attributes": attrs}
+
+        return retdict
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        if json_obj['type'] != "Stream":
+            raise TypeError("Invalid data type")
+
+        # Create dummy object
+        ret = Stream(dace.dtypes.int8, 1, 1)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        # TODO: FIXME:
+        # Since the strides are a list-property (normal Property()),
+        # loading from/to string (and, consequently, from/to json)
+        # leads to validation errors (contains Strings/Integers, not sympy symbols).
+        # To fix this, it needs a custom class
+        # For now, this is a workaround:
+        ret.strides = list(map(symbolic.pystr_to_symbolic, ret.strides))
+
+        # Check validity now
+        ret.validate()
+        return ret
 
     def __repr__(self):
         return 'Stream (dtype=%s, shape=%s)' % (self.dtype, self.shape)
@@ -431,12 +536,12 @@ class Stream(Data):
                     return False
         return True
 
-    def signature(self, with_types=True, name=None):
-        if not with_types: return name
+    def signature(self, with_types=True, for_call=False, name=None):
+        if not with_types or for_call: return name
         if self.storage in [
-                dace.types.StorageType.GPU_Global,
-                dace.types.StorageType.GPU_Shared,
-                dace.types.StorageType.GPU_Stack
+                dace.dtypes.StorageType.GPU_Global,
+                dace.dtypes.StorageType.GPU_Shared,
+                dace.dtypes.StorageType.GPU_Stack
         ]:
             return 'dace::GPUStream<%s, %s> %s' % (
                 str(self.dtype.ctype), 'true'

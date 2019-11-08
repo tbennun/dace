@@ -4,7 +4,8 @@ import operator
 import copy as cp
 
 import dace
-from dace import data as dt, subsets, symbolic, types
+import dace.serialize
+from dace import data as dt, subsets, symbolic, dtypes
 from dace.frontend.operations import detect_reduction_type
 from dace.frontend.python.astutils import unparse
 from dace.properties import (
@@ -30,6 +31,8 @@ class Memlet(object):
     wcr = LambdaProperty(allow_none=True)
     wcr_identity = Property(dtype=object, default=None, allow_none=True)
     wcr_conflict = Property(dtype=bool, default=True)
+    allow_oob = Property(
+        dtype=bool, default=False, desc='Bypass out-of-bounds validation')
 
     def __init__(self,
                  data,
@@ -48,27 +51,27 @@ class Memlet(object):
                         AccessNode.
             @param num_accesses: The number of times that the moved data
                                  will be subsequently accessed. If
-                                 `dace.types.DYNAMIC` (-1),
+                                 `dace.dtypes.DYNAMIC` (-1),
                                  designates that the number of accesses is
                                  unknown at compile time.
             @param subset: The subset of `data` that is going to be accessed.
             @param vector_length: The length of a single unit of access to
-                                  the data (used for vectorization 
+                                  the data (used for vectorization
                                   optimizations).
             @param wcr: A lambda function specifying how write-conflicts
                         are resolved. The syntax of the lambda function receives two elements: `current` value and `new` value,
                         and returns the value after resolution. For example,
                         summation is `lambda cur, new: cur + new`.
-            @param wcr_identity: Identity value used for the first write 
+            @param wcr_identity: Identity value used for the first write
                                  conflict. B{Note:} this parameter will soon
                                  be deprecated.
-            @param other_subset: The reindexing of `subset` on the other 
+            @param other_subset: The reindexing of `subset` on the other
                                  connected data.
-            @param debuginfo: Source-code information (e.g., line, file) 
+            @param debuginfo: Source-code information (e.g., line, file)
                               used for debugging.
-            @param wcr_conflict: If False, forces non-locked conflict 
+            @param wcr_conflict: If False, forces non-locked conflict
                                  resolution when generating code. The default
-                                 is to let the code generator infer this 
+                                 is to let the code generator infer this
                                  information from the SDFG.
         """
 
@@ -91,14 +94,23 @@ class Memlet(object):
 
         self.debuginfo = debuginfo
 
-    def toJSON(self, indent=0):
-        json = " " * indent + "{\n"
-        indent += 2
-        json += " " * indent + "\"type\" : \"" + type(self).__name__ + "\",\n"
-        json += " " * indent + "\"label\" : \"" + str(self) + "\"\n"
-        indent -= 2
-        json += " " * indent + "}\n"
-        return json
+    def to_json(self, parent_graph=None):
+        attrs = dace.serialize.all_properties_to_json(self)
+
+        retdict = {"type": "Memlet", "label": str(self), "attributes": attrs}
+
+        return retdict
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        if json_obj['type'] != "Memlet":
+            raise TypeError("Invalid data type")
+
+        # Create dummy object
+        ret = Memlet("", dace.dtypes.DYNAMIC, None, 1)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+
+        return ret
 
     @staticmethod
     def simple(data,
@@ -115,34 +127,34 @@ class Memlet(object):
                          parameter will soon be deprecated.
             @type data: Either a string of the data descriptor name or an
                         AccessNode.
-            @param subset_str: The subset of `data` that is going to 
+            @param subset_str: The subset of `data` that is going to
                                be accessed in string format. Example: '0:N'.
             @param veclen: The length of a single unit of access to
                            the data (used for vectorization optimizations).
-            @param wcr_str: A lambda function (as a string) specifying 
-                            how write-conflicts are resolved. The syntax 
+            @param wcr_str: A lambda function (as a string) specifying
+                            how write-conflicts are resolved. The syntax
                             of the lambda function receives two elements:
                             `current` value and `new` value,
-                            and returns the value after resolution. For 
-                            example, summation is 
+                            and returns the value after resolution. For
+                            example, summation is
                             `'lambda cur, new: cur + new'`.
-            @param wcr_identity: Identity value used for the first write 
+            @param wcr_identity: Identity value used for the first write
                                  conflict. B{Note:} this parameter will soon
                                  be deprecated.
-            @param other_subset_str: The reindexing of `subset` on the other 
+            @param other_subset_str: The reindexing of `subset` on the other
                                      connected data (as a string).
-            @param wcr_conflict: If False, forces non-locked conflict 
+            @param wcr_conflict: If False, forces non-locked conflict
                                  resolution when generating code. The default
-                                 is to let the code generator infer this 
+                                 is to let the code generator infer this
                                  information from the SDFG.
             @param num_accesses: The number of times that the moved data
                                  will be subsequently accessed. If
-                                 `dace.types.DYNAMIC` (-1),
+                                 `dace.dtypes.DYNAMIC` (-1),
                                  designates that the number of accesses is
                                  unknown at compile time.
-            @param debuginfo: Source-code information (e.g., line, file) 
+            @param debuginfo: Source-code information (e.g., line, file)
                               used for debugging.
-                                 
+
         """
         subset = SubsetProperty.from_string(subset_str)
         if num_accesses is not None:
@@ -210,11 +222,11 @@ class Memlet(object):
         return self.subset.bounding_box_size()
 
     def validate(self, sdfg, state):
-        if self.data not in sdfg.arrays:
+        if self.data is not None and self.data not in sdfg.arrays:
             raise KeyError('Array "%s" not found in SDFG' % self.data)
 
     def __label__(self, sdfg, state):
-        """ Returns a string representation of the memlet for display in a 
+        """ Returns a string representation of the memlet for display in a
             graph.
 
             @param sdfg: The SDFG in which the memlet resides.
@@ -237,12 +249,17 @@ class Memlet(object):
 
         num_elements = self.subset.num_elements()
         if self.num_accesses != num_elements:
-            result += '(%s) ' % str(self.num_accesses)
+            if self.num_accesses == -1:
+                result += '(dyn) '
+            else:
+                result += '(%s) ' % SymbolicProperty.to_string(
+                    self.num_accesses)
         arrayNotation = True
         try:
             if shape is not None and reduce(operator.mul, shape, 1) == 1:
-                # Don't draw array if we're accessing a single element
-                arrayNotation = False
+                # Don't draw array if we're accessing a single element and it's zero
+                if all(s == 0 for s in self.subset.min_element()):
+                    arrayNotation = False
         except TypeError:
             # Will fail if trying to check the truth value of a sympy expr
             pass
@@ -251,7 +268,7 @@ class Memlet(object):
         if self.wcr is not None and str(self.wcr) != '':
             # Autodetect reduction type
             redtype = detect_reduction_type(self.wcr)
-            if redtype == types.ReductionType.Custom:
+            if redtype == dtypes.ReductionType.Custom:
                 wcrstr = unparse(ast.parse(self.wcr).body[0].value.body)
             else:
                 wcrstr = str(redtype)

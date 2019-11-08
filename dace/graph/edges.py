@@ -4,14 +4,14 @@ import enum
 import re
 
 import dace
-from dace import types
+from dace import dtypes
 from dace.graph.graph import Edge
 from dace.frontend.python import astutils
 from dace.properties import Property, CodeProperty, make_properties
 
 
 def assignments_from_string(astr):
-    """ Returns a dictionary of assignments from a semicolon-delimited 
+    """ Returns a dictionary of assignments from a semicolon-delimited
         string of expressions. """
 
     result = {}
@@ -24,14 +24,14 @@ def assignments_from_string(astr):
 
 
 def assignments_to_string(assdict):
-    """ Returns a semicolon-delimited string from a dictionary of assignment 
+    """ Returns a semicolon-delimited string from a dictionary of assignment
         expressions. """
     return '; '.join(['%s=%s' % (k, v) for k, v in assdict.items()])
 
 
 @make_properties
 class InterstateEdge(object):
-    """ An SDFG state machine edge. These edges can contain a condition     
+    """ An SDFG state machine edge. These edges can contain a condition
         (which may include data accesses for data-dependent decisions) and
         zero or more assignments of values to inter-state variables (e.g.,
         loop iterates).
@@ -43,7 +43,6 @@ class InterstateEdge(object):
         from_string=assignments_from_string,
         to_string=assignments_to_string)
     condition = CodeProperty(desc="Transition condition")
-    language = Property(enum=types.Language, default=types.Language.Python)
 
     def __init__(self, condition=None, assignments=None):
 
@@ -60,7 +59,7 @@ class InterstateEdge(object):
 
     def is_unconditional(self):
         """ Returns True if the state transition is unconditional. """
-        return (self.condition == None or InterstateEdge.condition.to_string(
+        return (self.condition is None or InterstateEdge.condition.to_string(
             self.condition).strip() == "1")
 
     def condition_sympy(self):
@@ -70,11 +69,25 @@ class InterstateEdge(object):
     def condition_symbols(self):
         return dace.symbolic.symbols_in_ast(self.condition[0])
 
-    def toJSON(self, indent=0):
-        json = str(self.label)
-        # get rid of newlines (why are they there in the first place?)
-        json = re.sub(r"\n", " ", json)
-        return "\"" + json + "\""
+    def to_json(self, parent=None):
+        ret = {
+            'type': type(self).__name__,
+            'attributes': dace.serialize.all_properties_to_json(self),
+            'label': self.label
+        }
+
+        return ret
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        if json_obj['type'] != "InterstateEdge":
+            raise TypeError("Invalid data type")
+
+        # Create dummy object
+        ret = InterstateEdge()
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+
+        return ret
 
     @property
     def label(self):
@@ -93,7 +106,7 @@ class InterstateEdge(object):
             return astutils.unparse(self.condition)
 
         # Edges with assigments and conditions
-        return assignments + '; ' + astutils.unparse(self.condition)
+        return astutils.unparse(self.condition) + '; ' + assignments
 
     @property
     def dotOpts(self):

@@ -4,16 +4,16 @@
 import ast
 from copy import deepcopy as dcpy
 import itertools
+import dace.serialize
 from typing import Set
 from dace.graph import dot, graph
 from dace.frontend.python.astutils import unparse
-from dace.properties import (Property, CodeProperty, LambdaProperty,
-                             ParamsProperty, RangeProperty, DebugInfoProperty,
-                             SetProperty, make_properties, indirect_properties,
-                             DataProperty, SymbolicProperty)
+from dace.properties import (
+    Property, CodeProperty, LambdaProperty, ParamsProperty, RangeProperty,
+    DebugInfoProperty, SetProperty, make_properties, indirect_properties,
+    DataProperty, SymbolicProperty, ListProperty, SDFGReferenceProperty)
 from dace.frontend.operations import detect_reduction_type
-from dace import data, subsets as sbs, types
-import pickle
+from dace import data, subsets as sbs, dtypes
 
 # -----------------------------------------------------------------------------
 
@@ -27,9 +27,9 @@ class Node(object):
     out_connectors = SetProperty(
         str, default=set(), desc="A set of output connectors for this node.")
 
-    def __init__(self, in_connectors=set(), out_connectors=set()):
-        self.in_connectors = in_connectors
-        self.out_connectors = out_connectors
+    def __init__(self, in_connectors=None, out_connectors=None):
+        self.in_connectors = in_connectors or set()
+        self.out_connectors = out_connectors or set()
 
     def __str__(self):
         if hasattr(self, 'label'):
@@ -40,25 +40,35 @@ class Node(object):
     def validate(self, sdfg, state):
         pass
 
-    def toJSON(self, indent=0):
+    def to_json(self, parent):
         labelstr = str(self)
         typestr = str(type(self).__name__)
-        inconn = "[" + ",".join(
-            ['"' + str(x) + '"' for x in self.in_connectors]) + "]"
-        outconn = "[" + ",".join(
-            ['"' + str(x) + '"' for x in self.out_connectors]) + "]"
-        json = " " * indent + "{ \"label\": \"" + labelstr
-        json += "\", \"type\": \"" + typestr + "\", \"in_connectors\": " + inconn
-        json += ", \"out_connectors\" :" + outconn
-        json += "}\n"
-        return json
+
+        scope_entry_node = parent.entry_node(self)
+        if scope_entry_node is not None:
+            ens = parent.exit_nodes(parent.entry_node(self))
+            scope_exit_nodes = [str(parent.node_id(x)) for x in ens]
+            scope_entry_node = str(parent.node_id(scope_entry_node))
+        else:
+            scope_entry_node = None
+            scope_exit_nodes = []
+
+        retdict = {
+            "type": typestr,
+            "label": labelstr,
+            "attributes": dace.serialize.all_properties_to_json(self),
+            "id": parent.node_id(self),
+            "scope_entry": scope_entry_node,
+            "scope_exits": scope_exit_nodes
+        }
+        return retdict
 
     def __repr__(self):
         return type(self).__name__ + ' (' + self.__str__() + ')'
 
     def add_in_connector(self, connector_name: str):
         """ Adds a new input connector to the node. The operation will fail if
-            a connector (either input or output) with the same name already 
+            a connector (either input or output) with the same name already
             exists in the node.
 
             @param connector_name: The name of the new connector.
@@ -75,7 +85,7 @@ class Node(object):
 
     def add_out_connector(self, connector_name: str):
         """ Adds a new output connector to the node. The operation will fail if
-            a connector (either input or output) with the same name already 
+            a connector (either input or output) with the same name already
             exists in the node.
 
             @param connector_name: The name of the new connector.
@@ -152,14 +162,16 @@ class AccessNode(Node):
     """ A node that accesses data in the SDFG. Denoted by a circular shape. """
 
     access = Property(
-        enum=types.AccessType,
+        choices=dtypes.AccessType,
         desc="Type of access to this array",
-        default=types.AccessType.ReadWrite)
+        default=dtypes.AccessType.ReadWrite)
     setzero = Property(dtype=bool, desc="Initialize to zero", default=False)
     debuginfo2 = DebugInfoProperty()
     data = DataProperty(desc="Data (array, stream, scalar) to access")
 
-    def __init__(self, data, access=types.AccessType.ReadWrite,
+    def __init__(self,
+                 data,
+                 access=dtypes.AccessType.ReadWrite,
                  debuginfo=None):
         super(AccessNode, self).__init__()
 
@@ -169,6 +181,12 @@ class AccessNode(Node):
         if not isinstance(data, str):
             raise TypeError('Data for AccessNode must be a string')
         self.data = data
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        ret = AccessNode("Nodata")
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        return ret
 
     def __deepcopy__(self, memo):
         node = object.__new__(AccessNode)
@@ -212,8 +230,8 @@ class AccessNode(Node):
 
 
 class CodeNode(Node):
-    """ A node that contains runnable code with acyclic external data 
-        dependencies. May either be a tasklet or a nested SDFG, and 
+    """ A node that contains runnable code with acyclic external data
+        dependencies. May either be a tasklet or a nested SDFG, and
         denoted by an octagonal shape. """
     pass
 
@@ -221,14 +239,13 @@ class CodeNode(Node):
 @make_properties
 class Tasklet(CodeNode):
     """ A node that contains a tasklet: a functional computation procedure
-        that can only access external data specified using connectors. 
-        
-        Tasklets may be implemented in Python, C++, or any supported 
-        language by the code generator. 
+        that can only access external data specified using connectors.
+
+        Tasklets may be implemented in Python, C++, or any supported
+        language by the code generator.
     """
 
     label = Property(dtype=str, desc="Name of the tasklet")
-    language = Property(enum=types.Language, default=types.Language.Python)
     code = CodeProperty(desc="Tasklet code")
     code_global = CodeProperty(
         desc="Global scope code needed for tasklet execution", default="")
@@ -241,28 +258,45 @@ class Tasklet(CodeNode):
         dtype=str, desc="Tasklet execution location descriptor")
     debuginfo = DebugInfoProperty()
 
+    instrument = Property(
+        choices=dtypes.InstrumentationType,
+        desc="Measure execution statistics with given method",
+        default=dtypes.InstrumentationType.No_Instrumentation)
+
     def __init__(self,
                  label,
-                 inputs=set(),
-                 outputs=set(),
+                 inputs=None,
+                 outputs=None,
                  code="",
-                 language=types.Language.Python,
+                 language=dtypes.Language.Python,
                  code_global="",
                  code_init="",
                  code_exit="",
                  location="-1",
                  debuginfo=None):
-        super(Tasklet, self).__init__(inputs, outputs)
+        super(Tasklet, self).__init__(inputs or set(), outputs or set())
 
         # Properties
         self.label = label
-        self.language = language
-        self.code = code
+        # Set the language directly
+        #self.language = language
+        self.code = {'code_or_block': code, 'language': language}
+
         self.location = location
-        self.code_global = code_global
-        self.code_init = code_init
-        self.code_exit = code_exit
+        self.code_global = {'code_or_block': code_global, 'language': language}
+        self.code_init = {'code_or_block': code_init, 'language': language}
+        self.code_exit = {'code_or_block': code_exit, 'language': language}
         self.debuginfo = debuginfo
+
+    @property
+    def language(self):
+        return self._code['language']
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        ret = Tasklet("dummylabel")
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        return ret
 
     @property
     def name(self):
@@ -301,6 +335,12 @@ class EmptyTasklet(Tasklet):
     def validate(self, sdfg, state):
         pass
 
+    @staticmethod
+    def from_json(json_obj, context=None):
+        ret = EmptyTasklet("dummylabel")
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        return ret
+
 
 # ------------------------------------------------------------------------------
 
@@ -312,18 +352,18 @@ class NestedSDFG(CodeNode):
 
         It is encouraged to use nested SDFGs instead of coarse-grained tasklets
         since they are analyzable with respect to transformations.
-        
+
         @note: A nested SDFG cannot create recursion (one of its parent SDFGs).
     """
 
     label = Property(dtype=str, desc="Name of the SDFG")
     # NOTE: We cannot use SDFG as the type because of an import loop
-    sdfg = Property(dtype=graph.OrderedDiGraph, desc="The SDFG")
+    sdfg = SDFGReferenceProperty(dtype=graph.OrderedDiGraph, desc="The SDFG")
     schedule = Property(
-        dtype=types.ScheduleType,
+        dtype=dtypes.ScheduleType,
         desc="SDFG schedule",
-        enum=types.ScheduleType,
-        from_string=lambda x: types.ScheduleType[x])
+        choices=dtypes.ScheduleType,
+        from_string=lambda x: dtypes.ScheduleType[x])
     location = Property(dtype=str, desc="SDFG execution location descriptor")
     debuginfo = DebugInfoProperty()
     is_collapsed = Property(
@@ -331,12 +371,17 @@ class NestedSDFG(CodeNode):
         desc="Show this node/scope/state as collapsed",
         default=False)
 
+    instrument = Property(
+        choices=dtypes.InstrumentationType,
+        desc="Measure execution statistics with given method",
+        default=dtypes.InstrumentationType.No_Instrumentation)
+
     def __init__(self,
                  label,
                  sdfg,
                  inputs: Set[str],
                  outputs: Set[str],
-                 schedule=types.ScheduleType.Default,
+                 schedule=dtypes.ScheduleType.Default,
                  location="-1",
                  debuginfo=None):
         super(NestedSDFG, self).__init__(inputs, outputs)
@@ -347,6 +392,22 @@ class NestedSDFG(CodeNode):
         self.schedule = schedule
         self.location = location
         self.debuginfo = debuginfo
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        from dace import SDFG  # Avoid import loop
+
+        # We have to load the SDFG first.
+        ret = NestedSDFG("nolabel", SDFG('nosdfg'), set(), set())
+
+        dace.serialize.set_properties_from_json(ret, json_obj, context)
+
+        if context and 'sdfg_state' in context:
+            ret.sdfg.parent = context['sdfg_state']
+        if context and 'sdfg' in context:
+            ret.sdfg.parent_sdfg = context['sdfg']
+
+        return ret
 
     def draw_node(self, sdfg, graph):
         return dot.draw_node(sdfg, graph, self, shape="doubleoctagon")
@@ -396,17 +457,24 @@ class ExitNode(Node):
 # ------------------------------------------------------------------------------
 
 
+@dace.serialize.serializable
 class MapEntry(EntryNode):
-    """ Node that opens a Map scope. 
+    """ Node that opens a Map scope.
         @see: Map
     """
 
-    def __init__(self, map, dynamic_inputs=set()):
-        super(MapEntry, self).__init__(dynamic_inputs)
+    def __init__(self, map, dynamic_inputs=None):
+        super(MapEntry, self).__init__(dynamic_inputs or set())
         if map is None:
             raise ValueError("Map for MapEntry can not be None.")
         self._map = map
-        self._map_depth = 0
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        m = Map("", [], [])
+        ret = MapEntry(map=m)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        return ret
 
     @property
     def map(self):
@@ -425,6 +493,7 @@ class MapEntry(EntryNode):
         return str(self.map)
 
 
+@dace.serialize.serializable
 class MapExit(ExitNode):
     """ Node that closes a Map scope.
         @see: Map
@@ -436,6 +505,16 @@ class MapExit(ExitNode):
             raise ValueError("Map for MapExit can not be None.")
         self._map = map
 
+    @staticmethod
+    def from_json(json_obj, context=None):
+        # Set map reference to map entry
+        entry_node = context['sdfg_state'].node(int(json_obj['scope_entry']))
+
+        ret = MapExit(map=entry_node.map)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+
+        return ret
+
     @property
     def map(self):
         return self._map
@@ -443,6 +522,18 @@ class MapExit(ExitNode):
     @map.setter
     def map(self, val):
         self._map = val
+
+    @property
+    def schedule(self):
+        return self._map.schedule
+
+    @schedule.setter
+    def schedule(self, val):
+        self._map.schedule = val
+
+    @property
+    def label(self):
+        return self._map.label
 
     def draw_node(self, sdfg, graph):
         return dot.draw_node(sdfg, graph, self, shape="invtrapezium")
@@ -454,49 +545,42 @@ class MapExit(ExitNode):
 @make_properties
 class Map(object):
     """ A Map is a two-node representation of parametric graphs, containing
-        an integer set by which the contents (nodes dominated by an entry 
+        an integer set by which the contents (nodes dominated by an entry
         node and post-dominated by an exit node) are replicated.
-        
+
         Maps contain a `schedule` property, which specifies how the scope
         should be scheduled (execution order). Code generators can use the
         schedule property to generate appropriate code, e.g., GPU kernels.
     """
-    from dace.codegen.instrumentation.perfsettings import PerfSettings
 
     # List of (editable) properties
     label = Property(dtype=str, desc="Label of the map")
     params = ParamsProperty(desc="Mapped parameters")
     range = RangeProperty(desc="Ranges of map parameters")
-    #   order = OrderProperty(desc="Order of map dimensions", unmapped=True)
     schedule = Property(
-        dtype=types.ScheduleType,
+        dtype=dtypes.ScheduleType,
         desc="Map schedule",
-        enum=types.ScheduleType,
-        from_string=lambda x: types.ScheduleType[x])
+        choices=dtypes.ScheduleType,
+        from_string=lambda x: dtypes.ScheduleType[x])
     is_async = Property(dtype=bool, desc="Map asynchronous evaluation")
     unroll = Property(dtype=bool, desc="Map unrolling")
     flatten = Property(dtype=bool, desc="Map loop flattening")
-    fence_instrumentation = Property(
-        dtype=bool, desc="Disable instrumentation in all subnodes")
-    papi_counters = Property(
-        dtype=list,
-        desc="List of PAPI counter preset identifiers.",
-        default=PerfSettings.perf_default_papi_counters())
     debuginfo = DebugInfoProperty()
     is_collapsed = Property(
         dtype=bool,
         desc="Show this node/scope/state as collapsed",
         default=False)
 
-    # We cannot have multiple consecutive papi start/stops inside the same thread. The following variable is used to recognize the map that started the counters.
-    _has_papi_counters = False
-    _can_be_supersection_start = True  # We must have supersections synchronized.
+    instrument = Property(
+        choices=dtypes.InstrumentationType,
+        desc="Measure execution statistics with given method",
+        default=dtypes.InstrumentationType.No_Instrumentation)
 
     def __init__(self,
                  label,
                  params,
                  ndrange,
-                 schedule=types.ScheduleType.Default,
+                 schedule=dtypes.ScheduleType.Default,
                  unroll=False,
                  is_async=False,
                  flatten=False,
@@ -533,23 +617,31 @@ class Map(object):
 
 # Indirect Map properties to MapEntry and MapExit
 MapEntry = indirect_properties(Map, lambda obj: obj.map)(MapEntry)
-MapExit = indirect_properties(Map, lambda obj: obj.map)(MapExit)
 
 # ------------------------------------------------------------------------------
 
 
+@dace.serialize.serializable
 class ConsumeEntry(EntryNode):
-    """ Node that opens a Consume scope. 
+    """ Node that opens a Consume scope.
         @see: Consume
     """
 
-    def __init__(self, consume, dynamic_inputs=set()):
-        super(ConsumeEntry, self).__init__(dynamic_inputs)
+    def __init__(self, consume, dynamic_inputs=None):
+        super(ConsumeEntry, self).__init__(dynamic_inputs or set())
         if consume is None:
             raise ValueError("Consume for ConsumeEntry can not be None.")
         self._consume = consume
+        self._map_depth = 0
         self.add_in_connector('IN_stream')
         self.add_out_connector('OUT_stream')
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        c = Consume("", ['i', 1], None)
+        ret = ConsumeEntry(consume=c)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        return ret
 
     @property
     def map(self):
@@ -574,8 +666,9 @@ class ConsumeEntry(EntryNode):
         return str(self.consume)
 
 
+@dace.serialize.serializable
 class ConsumeExit(ExitNode):
-    """ Node that closes a Consume scope. 
+    """ Node that closes a Consume scope.
         @see: Consume
     """
 
@@ -584,6 +677,15 @@ class ConsumeExit(ExitNode):
         if consume is None:
             raise ValueError("Consume for ConsumeExit can not be None.")
         self._consume = consume
+
+    @staticmethod
+    def from_json(json_obj, context=None):
+        # Set map reference to entry node
+        entry_node = context['sdfg_state'].node(int(json_obj['scope_entry']))
+
+        ret = ConsumeExit(consume=entry_node.consume)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        return ret
 
     @property
     def map(self):
@@ -597,6 +699,18 @@ class ConsumeExit(ExitNode):
     def consume(self, val):
         self._consume = val
 
+    @property
+    def schedule(self):
+        return self._consume.schedule
+
+    @schedule.setter
+    def schedule(self, val):
+        self._consume.schedule = val
+
+    @property
+    def label(self):
+        return self._consume.label
+
     def draw_node(self, sdfg, graph):
         return dot.draw_node(
             sdfg, graph, self, shape="invtrapezium", style='dashed')
@@ -607,8 +721,8 @@ class ConsumeExit(ExitNode):
 
 @make_properties
 class Consume(object):
-    """ Consume is a scope, like `Map`, that is a part of the parametric 
-        graph extension of the SDFG. It creates a producer-consumer 
+    """ Consume is a scope, like `Map`, that is a part of the parametric
+        graph extension of the SDFG. It creates a producer-consumer
         relationship between the input stream and the scope subgraph. The
         subgraph is scheduled to a given number of processing elements
         for processing, and they will try to pop elements from the input
@@ -619,12 +733,11 @@ class Consume(object):
     pe_index = Property(dtype=str, desc="Processing element identifier")
     num_pes = SymbolicProperty(desc="Number of processing elements")
     condition = CodeProperty(desc="Quiescence condition", allow_none=True)
-    language = Property(enum=types.Language, default=types.Language.Python)
     schedule = Property(
-        dtype=types.ScheduleType,
+        dtype=dtypes.ScheduleType,
         desc="Consume schedule",
-        enum=types.ScheduleType,
-        from_string=lambda x: types.ScheduleType[x])
+        choices=dtypes.ScheduleType,
+        from_string=lambda x: dtypes.ScheduleType[x])
     chunksize = Property(
         dtype=int,
         desc="Maximal size of elements to consume at a time",
@@ -634,6 +747,11 @@ class Consume(object):
         dtype=bool,
         desc="Show this node/scope/state as collapsed",
         default=False)
+
+    instrument = Property(
+        choices=dtypes.InstrumentationType,
+        desc="Measure execution statistics with given method",
+        default=dtypes.InstrumentationType.No_Instrumentation)
 
     def as_map(self):
         """ Compatibility function that allows to view the consume as a map,
@@ -645,7 +763,7 @@ class Consume(object):
                  label,
                  pe_tuple,
                  condition,
-                 schedule=types.ScheduleType.Default,
+                 schedule=dtypes.ScheduleType.Default,
                  chunksize=1,
                  debuginfo=None):
         super(Consume, self).__init__()
@@ -679,40 +797,37 @@ class Consume(object):
 # Redirect Consume properties to ConsumeEntry and ConsumeExit
 ConsumeEntry = indirect_properties(Consume,
                                    lambda obj: obj.consume)(ConsumeEntry)
-ConsumeExit = indirect_properties(Consume,
-                                  lambda obj: obj.consume)(ConsumeExit)
 
 # ------------------------------------------------------------------------------
 
 
 @make_properties
 class Reduce(Node):
-    """ An SDFG node that reduces an N-dimensional array to an 
+    """ An SDFG node that reduces an N-dimensional array to an
         (N-k)-dimensional array, with a list of axes to reduce and
         a reduction binary function. """
-    from dace.codegen.instrumentation.perfsettings import PerfSettings
 
     # Properties
-    axes = Property(dtype=tuple, allow_none=True)
+    axes = ListProperty(element_type=int, allow_none=True)
     wcr = LambdaProperty()
     identity = Property(dtype=object, allow_none=True)
     schedule = Property(
-        dtype=types.ScheduleType,
+        dtype=dtypes.ScheduleType,
         desc="Reduction execution policy",
-        enum=types.ScheduleType,
-        from_string=lambda x: types.ScheduleType[x])
-
-    papi_counters = Property(
-        dtype=list,
-        desc="List of PAPI counter preset identifiers.",
-        default=PerfSettings.perf_default_papi_counters())
+        choices=dtypes.ScheduleType,
+        from_string=lambda x: dtypes.ScheduleType[x])
     debuginfo = DebugInfoProperty()
+
+    instrument = Property(
+        choices=dtypes.InstrumentationType,
+        desc="Measure execution statistics with given method",
+        default=dtypes.InstrumentationType.No_Instrumentation)
 
     def __init__(self,
                  wcr,
                  axes,
                  wcr_identity=None,
-                 schedule=types.ScheduleType.Default,
+                 schedule=dtypes.ScheduleType.Default,
                  debuginfo=None):
         super(Reduce, self).__init__()
         self.wcr = wcr  # type: ast._Lambda
@@ -724,10 +839,16 @@ class Reduce(Node):
     def draw_node(self, sdfg, state):
         return dot.draw_node(sdfg, state, self, shape="invtriangle")
 
+    @staticmethod
+    def from_json(json_obj, context=None):
+        ret = Reduce("(lambda a, b: (a + b))", None)
+        dace.serialize.set_properties_from_json(ret, json_obj, context=context)
+        return ret
+
     def __str__(self):
         # Autodetect reduction type
         redtype = detect_reduction_type(self.wcr)
-        if redtype == types.ReductionType.Custom:
+        if redtype == dtypes.ReductionType.Custom:
             wcrstr = unparse(ast.parse(self.wcr).body[0].value.body)
         else:
             wcrstr = str(redtype)
@@ -739,7 +860,7 @@ class Reduce(Node):
     def __label__(self, sdfg, state):
         # Autodetect reduction type
         redtype = detect_reduction_type(self.wcr)
-        if redtype == types.ReductionType.Custom:
+        if redtype == dtypes.ReductionType.Custom:
             wcrstr = unparse(ast.parse(self.wcr).body[0].value.body)
         else:
             wcrstr = str(redtype)
