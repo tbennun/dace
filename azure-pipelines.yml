@@ -22,6 +22,9 @@ jobs:
     maxParallel: 4
 
   steps:
+  - checkout: self
+    submodules: recursive
+    
   - task: UsePythonVersion@0
     inputs:
       versionSpec: '$(python.version)'
@@ -31,7 +34,7 @@ jobs:
     displayName: 'Install dependencies'
 
   - script: |
-      ./test_all.sh
+      NOSTATUSBAR=1 ./test_all.sh
     displayName: 'test'
 
   - task: PublishTestResults@2
