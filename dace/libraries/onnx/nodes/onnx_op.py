@@ -12,6 +12,7 @@ from dace.libraries.standard.nodes.code import _get_inputs_and_outputs
 from dace.libraries.onnx.schema import ONNXSchema, ONNXAttributeType, _ATTR_TYPE_TO_PYTHON_TYPE, ONNXParameterType
 from dace.libraries.onnx import ONNXRuntime
 
+_ONNX_NODES = []
 
 def get_missing_arguments_message(function_name, missing_arguments,
                                   argument_type):
@@ -308,16 +309,17 @@ for schema in onnx.defs.get_all_schemas():
                 return nd.Tasklet('onnx_code',
                                   set(inputs.keys()),
                                   set(outputs.keys()),
-                                  "onnx:NodeProto proto;",
+                                  "onnx::NodeProto proto;",
                                   language=dace.dtypes.Language.CPP)
 
         self.implementations['default'] = Expansion
         Expansion._match_node = self
         self.implementation = 'default'
-        self.register_implementation('default', Expansion)
 
     attrs['__init__'] = __init__
 
     cls = type(dace_schema.name, (ONNXOp, ), attrs)
 
-    vars()[schema.name] = dace.library.node(cls)
+    globals()[schema.name] = dace.library.node(cls)
+
+del cls
