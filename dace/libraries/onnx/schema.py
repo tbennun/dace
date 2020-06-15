@@ -116,6 +116,9 @@ class ONNXParameter:
     homogeneous = Property(dtype=bool,
                            desc="Whether this parameter is homogeneous")
 
+    def __repr__(self):
+        return self.param_type + "\t" + self.name
+
 
 class ONNXAttributeType(aenum.AutoNumberEnum):
     Int = ()
@@ -151,6 +154,9 @@ class ONNXAttribute:
                              default=None,
                              allow_none=True)
 
+    def __repr__(self):
+        return self.name
+
 
 @onnx_representation(onnx.defs.OpSchema.TypeConstraintParam,
                      type_str='type_param_str',
@@ -168,6 +174,9 @@ class ONNXTypeConstraint:
         desc=
         "The possible types. Note that only tensor types are currently supported."
     )
+
+    def __repr__(self):
+        return self.type_str
 
 
 @onnx_representation(
@@ -199,6 +208,9 @@ class ONNXSchema:
                           desc="The operator input parameter descriptors")
     outputs = ListProperty(element_type=ONNXParameter,
                            desc="The operator output parameter descriptors")
+
+    def __repr__(self):
+        return self.domain + self.name
 
     def validate(self):
         # check all parameters with a type str have a entry in the type constraints

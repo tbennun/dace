@@ -101,13 +101,13 @@ ONNX_DTYPES_TO_DACE_TYPE_CLASS = {
     'uint16': dt.uint16,
     'uint32': dt.int32,
     'uint64': dt.uint64,
+    # TODO double check this vs bfloat16
     'float16': dt.float16,
     'float': dt.float32,
     'double': dt.float64,
     'complex64': dt.complex64,
     'complex128': dt.complex128,
 }
-
 
 def onnx_type_str_onnx_type_str_to_dace_type(
         onnx_str) -> Union[typeclass, None]:
