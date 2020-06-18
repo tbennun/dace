@@ -503,8 +503,6 @@ class ONNXOp(nd.LibraryNode, ABC):
             "__ort_api->ReleaseExecutableKernelContext(__ort_context_{});\n".
             format(unique_id))
 
-        tasklet_code += 'std::cout << "Compute {}" << std::endl;'.format(
-            unique_id)
         tasklet_code += "__ort_check_status(__ort_api->ExecutableKernelContext_Compute(__ort_context_{}));\n".format(
             unique_id)
 
@@ -517,6 +515,7 @@ class ONNXOp(nd.LibraryNode, ABC):
 
 
 _ONNX_OPS_BY_NAME = {}
+# Generate all of the Op Nodes
 for schema in onnx.defs.get_all_schemas():
     try:
         dace_schema = ONNXSchema.from_onnx_proto(schema)

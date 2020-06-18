@@ -63,7 +63,6 @@ class ONNXModel:
                 raise ValueError("Got input or output without name")
             if value.name not in self.value_infos:
                 self.value_infos[value.name] = value
-                self._add_value_info(value)
 
         # add weights
         self.weights = {}
@@ -77,7 +76,7 @@ class ONNXModel:
                     node.op_type))
 
             # extract the op attributes
-            # TODO check HasField name here
+
             op_attributes = {
                 attribute_proto.name: convert_attribute_proto(attribute_proto)
                 for attribute_proto in node.attribute
@@ -96,8 +95,10 @@ class ONNXModel:
                     enumerate(zip(node.input, repeat(True))),
                     enumerate(zip(node.output, repeat(False)))):
                 if self._clean_array_name(name) not in self.sdfg.arrays: #and self._clean_array_name(name) not in self.sdfg.constants_prop:
-                    raise ValueError(
-                        "Could not find array with name '{}'".format(name))
+                    if name not in self.value_infos:
+                        raise ValueError(
+                            "Could not find array with name '{}'".format(name))
+                    self._add_value_info(self.value_infos[name])
 
 
                 # get the access node
@@ -114,7 +115,7 @@ class ONNXModel:
                 # get the connector name
                 params = op_node.schema.inputs if is_input else op_node.schema.outputs
                 params_len = len(params)
-                if param_idx > params_len:
+                if param_idx >= params_len:
                     # this is a variadic parameter. Then the last parameter of the parameter must be variadic.
                     if params[-1].param_type != ONNXParameterType.Variadic:
                         raise ValueError(
@@ -132,10 +133,7 @@ class ONNXModel:
                 else:
                     conn_name = params[param_idx].name
 
-                if self._clean_array_name(name) in self.sdfg.arrays:
-                    data_desc = self.sdfg.arrays[self._clean_array_name(name)]
-                #else:
-                #    data_desc, _ = self.sdfg.constants_prop[self._clean_array_name(name)]
+                data_desc = self.sdfg.arrays[self._clean_array_name(name)]
 
                 # add the connector if required, and add an edge
                 if is_input:
@@ -184,8 +182,7 @@ class ONNXModel:
 
         name = value_info.name
 
-        if (not _nested_HasField(value_info, "type.tensor_type.shape"))\
-                or (len(value_info.type.tensor_type.shape.dim) == 0):
+        if not _nested_HasField(value_info, "type.tensor_type.shape"):
             raise ValueError(
                 "Value '{}' does not have a shape in this graph."
                 " Please run shape inference before importing.".format(name))
@@ -197,13 +194,15 @@ class ONNXModel:
                 "Value '{}' does not have a type in this graph."
                 " Please run type inference before importing.".format(name))
 
+
         shape = []
         for d in tensor_type.shape.dim:
             if d.HasField("dim_value"):
                 shape.append(d.dim_value)
             elif d.HasField("dim_param"):
-                raise NotImplementedError(
-                    "Symbolic dimensions are currently not supported.")
+                if not d.dim_param in self.sdfg.symbols:
+                    self.sdfg.add_symbol(d.dim_param, stype=int)
+                shape.append(d.dim_param)
             else:
                 raise ValueError(
                     "Value '{}' does not have a shape in this graph."

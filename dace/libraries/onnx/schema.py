@@ -11,7 +11,8 @@ from dace.libraries.onnx.converters import convert_onnx_proto, onnx_type_str_onn
 
 _KNOWN_ONNX_PROTOS = {}
 
-# TODO @orausch: migrate all str types to bytes
+# TODO @orausch migrate all str types to bytes
+# TODO @orausch rethink how to check proto HasField
 
 def onnx_representation(represents, **mapping):
     """ Decorator for python representations of ONNX protobufs.
