@@ -1552,7 +1552,7 @@ class SDFG(OrderedDiGraph):
                 else:
                     continue
             if isinstance(expected, dace.data.Array):
-                if not isinstance(passed, np.ndarray):
+                if not dtypes.is_array(passed):
                     raise TypeError("Type mismatch for argument {}: "
                                     "expected array type, got {}".format(
                                         arg, type(passed)))
